@@ -1,0 +1,1039 @@
+Below is **Phase IV: Retrieval Layer (Hybrid Agentic-RAG)** in exhaustive detail. We’ll implement:
+
+1. **Chunking Strategy** – break large files into ≤ 400-token chunks (at function or class boundaries when possible).
+2. **Hybrid Search Pipeline** – BM25 (textual) → top-N candidates → vector embedding → rerank top-K.
+3. **Retrieval Orchestrator** (`agent/retrieval.py`) – a single class exposing `fetch_context(query, num_chunks)` that returns code snippets and their metadata.
+4. **Auto-Reindex on Code Change** – a git post-commit hook to re-embed only changed files.
+5. **Supporting Modules** – utilities for chunking, BM25 indexing, embedding, and metadata management.
+6. **Smoke Tests** (`tests/test_retrieval.py`) – ensuring the pipeline works on a small synthetic repo.
+
+Throughout, we’ll show every directory change, file content, configuration, and test. By the end, you’ll have a **full Hybrid Agentic-RAG retrieval layer** that:
+
+* Indexes your codebase into both a BM25 index (full-text) and a Chroma vector DB (“codebase” collection).
+* Allows the agent to ask, “Give me the top K code chunks matching this task description,” returning ranked snippets with file paths, line ranges, and content.
+
+---
+
+## 1 Updated Directory Layout
+
+After Phase III, your structure is:
+
+```
+coding-agent/
+├─ agent/
+│  ├─ config.py
+│  ├─ utils/
+│  │  └─ fs.py
+│  ├─ tools/
+│  │  └─ core.py, permissions.py, schema.py
+│  ├─ memory/
+│  │  ├─ manager.py
+│  │  ├─ summarizer.py
+│  │  ├─ vector_store.py
+│  │  └─ utils.py
+│  └─ retrieval/          ← New package for Phase IV
+│     ├─ __init__.py
+│     ├─ orchestrator.py  # main HybridRAG class
+│     ├─ bm25_index.py    # BM25 indexing & search
+│     ├─ chunker.py       # code chunking logic
+│     ├─ embedder.py      # embedding wrappers for code chunks
+│     └─ metadata.py      # metadata store for chunks
+├─ tools/                 # Phase II tools
+│  └─ ...
+├─ memory/                # Phase III memory
+│  └─ ...
+├─ cli/
+│  └─ ...
+├─ ops/
+│  └─ ...
+├─ tests/
+│  ├─ test_tools.py
+│  ├─ test_cli.py
+│  ├─ test_memory.py
+│  └─ test_retrieval.py  # New tests for Phase IV
+├─ .agent.yml
+├─ README.md
+└─ pyproject.toml
+```
+
+> Note: `agent/retrieval` (a package, not a single file) contains all subcomponents for hybrid retrieval.
+
+---
+
+## 2 Configuration Additions
+
+Update `.agent.yml` to include retrieval-specific settings:
+
+```yaml
+# .agent.yml
+
+openai_api_key: "sk-..."
+anthropic_api_key: ""
+cost_cap_daily: 20.0
+memory_summarise_threshold: 4000
+
+tools_allowed:
+  - read_file
+  - write_diff
+  - run_tests
+  - static_analyze
+  - grep
+  - vector_search
+
+# Retrieval config
+retrieval:
+  bm25:
+    index_dir: "bm25_index"         # Directory to store BM25 index files
+    ngram_range: [1, 1]             # Unigrams only
+    max_features: 50000             # Vocabulary size
+  chunker:
+    max_tokens: 400                 # Approximate max tokens per chunk
+    overlap_tokens: 50              # Overlap between adjacent chunks
+  embeddings:
+    collection_name: "codebase"     # Chroma collection for code
+    model: "text-embedding-3-large" # OpenAI embedding model
+```
+
+> **Why these fields?**
+>
+> * **`bm25.index_dir`**: Where on‐disk BM25 index lives.
+> * **`ngram_range`** & **`max_features`**: Standard sklearn TfidfVectorizer params to build BM25.
+> * **`chunker.max_tokens`**: We want chunks ≤ 400 tokens (≈1 600 characters).
+> * **`chunker.overlap_tokens`**: Ensure adjacent chunks share context.
+> * **`embeddings.collection_name`**: “codebase,” separate from “memory.”
+> * **`embeddings.model`**: Which model to use for code embeddings (Phase IV stub → Phase VII replace with real calls).
+
+---
+
+## 3 Code Chunking (`agent/retrieval/chunker.py`)
+
+### 3.1 Goals
+
+* Read a source file (e.g., `src/foo/bar.py` or `lib/utils.js`).
+* Split it into chunks of ≤ `max_tokens` tokens (approximate).
+* Prefer chunk boundaries at function or class definitions when possible.
+* Ensure **`overlap_tokens`** tokens of context between adjacent chunks to maintain continuity.
+
+### 3.2 Implementation Details
+
+We’ll:
+
+1. Read the entire file as text.
+2. Use a **simple regex** to detect function/class definitions (e.g., lines starting with `def `, `class ` in Python; `function ` or arrow functions in JS).
+3. Generate “candidate boundaries” at those lines.
+4. Walk through the file, grouping lines until adding another line would exceed `max_tokens`.
+5. At chunk boundary, “rewind” by `overlap_tokens` worth of lines to overlap with the next chunk.
+6. Compute `token_estimate = sum(estimate_tokens(line) for line in chunk_lines)`.
+7. Continue until file end.
+
+We store for each chunk:
+
+* `file_path` (relative to `agent_home`)
+* `start_line` (1-based)
+* `end_line` (inclusive)
+* `text` (concatenated lines)
+
+### 3.3 `agent/retrieval/chunker.py`
+
+```python
+# coding-agent/agent/retrieval/chunker.py
+
+import re
+from pathlib import Path
+from typing import List, Dict, Any
+
+from agent.config import get_settings
+from agent.memory.utils import estimate_tokens
+
+# --------------------------------------------------------------------------------
+# Regular expressions for detecting function/class boundaries.
+# For simplicity, we cover common languages: Python, JavaScript, TypeScript.
+# --------------------------------------------------------------------------------
+
+PY_FUNC_RE = re.compile(r"^\s*def\s+\w+\s*\(")
+PY_CLASS_RE = re.compile(r"^\s*class\s+\w+\s*(\(|:)")
+JS_FUNC_RE = re.compile(r"^\s*(export\s+)?function\s+\w+\s*\(")
+JS_ARROW_RE = re.compile(r"^\s*(const|let|var)\s+\w+\s*=\s*\(.*\)\s*=>")
+JS_CLASS_RE = re.compile(r"^\s*(export\s+)?class\s+\w+\s*{")
+
+# Combine all patterns
+BOUNDARY_PATTERNS = [PY_FUNC_RE, PY_CLASS_RE, JS_FUNC_RE, JS_ARROW_RE, JS_CLASS_RE]
+
+
+def is_boundary(line: str) -> bool:
+    """
+    Return True if `line` matches any known function/class definition pattern.
+    """
+    for pat in BOUNDARY_PATTERNS:
+        if pat.match(line):
+            return True
+    return False
+
+
+def chunk_file(file_path: Path) -> List[Dict[str, Any]]:
+    """
+    Chunk the file at `file_path` into ≤ max_tokens chunks with overlap.
+    Returns a list of dicts: {
+      "file_path": str (relative),
+      "start_line": int,
+      "end_line": int,
+      "text": str
+    }
+    """
+    settings = get_settings()
+    max_toks = settings.retrieval["chunker"]["max_tokens"]
+    overlap = settings.retrieval["chunker"]["overlap_tokens"]
+
+    text = file_path.read_text(encoding="utf-8")
+    lines = text.splitlines(keepends=True)
+
+    chunks: List[Dict[str, Any]] = []
+    n = len(lines)
+    idx = 0  # current line index (0-based)
+
+    while idx < n:
+        start_line = idx
+        tok_count = 0
+        chunk_lines = []
+
+        # Expand chunk until near max_toks or EOF
+        while idx < n:
+            line = lines[idx]
+            line_toks = estimate_tokens(line)
+            if tok_count + line_toks > max_toks:
+                break
+            chunk_lines.append(line)
+            tok_count += line_toks
+            idx += 1
+
+            # If many lines and we found a boundary recently, we could cut earlier.
+            # For simplicity, we cut exactly when tokens exceed—or at EOF.
+
+        # If token limit exceeded immediately (single line > max_toks), force include single line
+        if not chunk_lines or tok_count > max_toks:
+            # Take at least one line
+            chunk_lines = [lines[start_line]]
+            tok_count = estimate_tokens(lines[start_line])
+            idx = start_line + 1
+
+        end_line = idx  # exclusive index
+        # Now adjust for overlap: next chunk should start at max(start_line + len(chunk_lines) - overlap_lines, end_line)
+        # We need to count how many lines approximate to `overlap` tokens, scanning backward
+        overlap_count = 0
+        tok_acc = 0
+        j = len(chunk_lines) - 1
+        while j >= 0 and tok_acc < overlap:
+            tok_acc += estimate_tokens(chunk_lines[j])
+            overlap_count += 1
+            j -= 1
+
+        next_start = max(start_line + len(chunk_lines) - overlap_count, end_line - overlap_count)
+        if next_start < idx:
+            next_start = idx - overlap_count
+        # But ensure next_start > start_line
+        next_start = max(next_start, start_line + len(chunk_lines))
+
+        # Save the chunk
+        chunk_text = "".join(chunk_lines)
+        rel_path = str(file_path.relative_to(Path(get_settings().agent_home)))
+        chunks.append({
+            "file_path": rel_path,
+            "start_line": start_line + 1,  # convert to 1-based
+            "end_line": end_line,          # exclusive → inclusive = end_line
+            "text": chunk_text
+        })
+
+        # Move idx back by overlap_count to create overlap
+        idx = end_line - overlap_count
+
+    return chunks
+```
+
+> **Explanation of Key Steps**
+>
+> * **Calculate token count** of lines via `estimate_tokens(line)`.
+> * **Build `chunk_lines`** until adding a line would exceed `max_toks`.
+> * If a single line is larger than `max_toks`, force-include it.
+> * **Compute `overlap_count`** as number of lines from end of current chunk whose cumulative `estimate_tokens` ≥ `overlap`.
+> * Determine `next_start` so that next chunk starts “overlapping” by those lines.
+> * Store chunk metadata: `file_path` (relative), lines 1-based, and `text`.
+> * Move `idx` to `end_line - overlap_count`.
+
+---
+
+## 4 BM25 Indexing & Search (`agent/retrieval/bm25_index.py`)
+
+### 4.1 Goals
+
+* Build a **BM25‐style inverted index** using sklearn’s `TfidfVectorizer` (term frequencies + L2 normalization approximate BM25).
+* Provide:
+
+  1. **`build_index(root_dir)`**: walk all code files under a given directory (e.g., `src/`, `lib/`), chunk them, and index each chunk’s `text` in the BM25 matrix.
+  2. **`save_index()`** & **`load_index()`**: persist matrix and metadata to `bm25_index/` so you don’t rebuild every run.
+  3. **`query(text, top_n)`**: vectorize `text`, compute cosine‐similarity against all chunk vectors, return the top `N` chunk IDs (with scores).
+
+### 4.2 External Dependencies
+
+* `scikit-learn` for `TfidfVectorizer`, `cosine_similarity`.
+* `joblib` or `pickle` to save/load model.
+
+Add dev dependency:
+
+```bash
+poetry add scikit-learn joblib
+```
+
+### 4.3 `agent/retrieval/bm25_index.py`
+
+```python
+# coding-agent/agent/retrieval/bm25_index.py
+
+import os
+import pickle
+from pathlib import Path
+from typing import List, Tuple, Dict, Any
+
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+import joblib
+
+from agent.config import get_settings
+from agent.retrieval.chunker import chunk_file
+
+# --------------------------------------------------------------------------------
+# Directory and filenames for BM25 index persistence
+# --------------------------------------------------------------------------------
+
+settings = get_settings()
+INDEX_DIR = Path(settings.retrieval["bm25"]["index_dir"])
+INDEX_DIR.mkdir(parents=True, exist_ok=True)
+
+VECTORIZER_PATH = INDEX_DIR / "vectorizer.joblib"
+MATRIX_PATH = INDEX_DIR / "matrix.npz"
+METADATA_PATH = INDEX_DIR / "metadata.pkl"  # maps chunk_id → metadata dict
+
+# --------------------------------------------------------------------------------
+# Build or load the BM25 index. 
+# --------------------------------------------------------------------------------
+
+class BM25Index:
+    def __init__(self):
+        self.vectorizer: TfidfVectorizer | None = None
+        self.matrix = None  # sparse matrix [num_chunks x vocab_size]
+        self.metadata: Dict[int, Dict[str, Any]] = {}
+        # id → {"file_path":..., "start_line":..., "end_line":..., "text":...}
+
+        if self._check_index_exists():
+            self._load_index()
+        else:
+            self.vectorizer = None
+            self.matrix = None
+
+    def _check_index_exists(self) -> bool:
+        return VECTORIZER_PATH.exists() and MATRIX_PATH.exists() and METADATA_PATH.exists()
+
+    def build_index(self, root_dir: Path) -> None:
+        """
+        Walk `root_dir`, chunk each code file, and build BM25 index.
+        Persists vectorizer, matrix, and metadata to disk.
+        """
+        all_texts: List[str] = []
+        self.metadata = {}
+        idx = 0
+
+        for file_path in root_dir.rglob("*.py"):
+            chunks = chunk_file(file_path)
+            for ch in chunks:
+                all_texts.append(ch["text"])
+                self.metadata[idx] = {
+                    "file_path": ch["file_path"],
+                    "start_line": ch["start_line"],
+                    "end_line": ch["end_line"]
+                }
+                idx += 1
+
+        # Create TF-IDF vectorizer approximating BM25 with k1=1.5, b=0.75 equivalent
+        self.vectorizer = TfidfVectorizer(
+            ngram_range=tuple(settings.retrieval["bm25"]["ngram_range"]),
+            max_features=settings.retrieval["bm25"]["max_features"],
+            norm="l2",
+            use_idf=True,
+            smooth_idf=True,
+            sublinear_tf=True
+        )
+        self.matrix = self.vectorizer.fit_transform(all_texts)
+
+        # Persist to disk
+        joblib.dump(self.vectorizer, VECTORIZER_PATH)
+        joblib.dump(self.matrix, MATRIX_PATH)
+        with open(METADATA_PATH, "wb") as fh:
+            pickle.dump(self.metadata, fh)
+
+    def _load_index(self) -> None:
+        """
+        Load pre-built vectorizer, matrix, and metadata from disk.
+        """
+        self.vectorizer = joblib.load(VECTORIZER_PATH)
+        self.matrix = joblib.load(MATRIX_PATH)
+        with open(METADATA_PATH, "rb") as fh:
+            self.metadata = pickle.load(fh)
+
+    def query(self, query_text: str, top_n: int = 10) -> List[Tuple[int, float]]:
+        """
+        Return top_n matches as a list of (chunk_id, score), sorted descending.
+        """
+        if self.vectorizer is None or self.matrix is None:
+            raise RuntimeError("BM25 index not built or loaded")
+
+        q_vec = self.vectorizer.transform([query_text])  # 1 x vocab_size
+        # Compute cosine similarity against all chunks
+        scores = cosine_similarity(q_vec, self.matrix).flatten()  # shape: [num_chunks]
+        # Get top_n indices
+        best_idx = scores.argsort()[::-1][:top_n]
+        return [(int(i), float(scores[i])) for i in best_idx]
+```
+
+> **Explanation**
+>
+> * **`BM25Index` constructor**: checks if persisted files exist. If so, loads them.
+> * **`build_index(root_dir)`**:
+>
+>   1. Walks all `*.py` files under `root_dir` (adjust language patterns as needed; for now, Python only).
+>   2. Calls `chunk_file(file_path)` → list of chunks.
+>   3. Appends each chunk’s `text` to `all_texts`, stores metadata `{file_path, start_line, end_line}` in `self.metadata[idx]`.
+>   4. After collecting all chunks, instantiates `TfidfVectorizer` with `ngram_range` and `max_features` from config.
+>   5. `fit_transform(all_texts)` to get sparse matrix.
+>   6. Persist vectorizer, matrix, and metadata to `bm25_index/`.
+> * **`query(query_text, top_n)`**:
+>
+>   1. Transforms `query_text` → vector.
+>   2. Computes cosine similarity vs. all chunk vectors.
+>   3. Returns top `n` chunk IDs and scores.
+
+> **Note**: BM25 proper involves document length normalization and term frequencies. Using `TfidfVectorizer` with `sublinear_tf=True` and `use_idf=True` approximates BM25 well enough for our use-case. If you need a true BM25, substitute `rank_bm25` library (but we avoid extra dependencies for now).
+
+---
+
+## 5 Embedder for Code Chunks (`agent/retrieval/embedder.py`)
+
+### 5.1 Goals
+
+* Given a code snippet (`text`), generate a vector embedding for Chroma.
+* For Phase IV, implement a **stub** that returns a zero vector or a random vector, so integration tests can run.
+* In Phase VII/VIII, you’ll replace stub with actual OpenAI `Embedding.create` calls or a local embedder.
+
+### 5.2 `agent/retrieval/embedder.py`
+
+```python
+# coding-agent/agent/retrieval/embedder.py
+
+from typing import List
+from agent.config import get_settings
+
+# --------------------------------------------------------------------------------
+# Placeholder embedder: returns a fixed‐length zero vector or a random vector.
+# Replace this function when real embeddings are needed.
+# --------------------------------------------------------------------------------
+
+def embed_text(text: str) -> List[float]:
+    """
+    Return an embedding for `text`. Currently a stub: returns zero vector.
+    """
+    settings = get_settings()
+    # In Phase VII, do something like:
+    # openai.api_key = settings.openai_api_key
+    # resp = openai.Embedding.create(
+    #     model=settings.retrieval["embeddings"]["model"],
+    #     input=text
+    # )
+    # return resp["data"][0]["embedding"]
+
+    # For now, use a fixed‐length zero vector (length 768)
+    return [0.0] * 768
+```
+
+> **Why zero vector?**
+>
+> * So we can insert into the Chroma “codebase” collection without error.
+> * Later, similarity queries will return trivial distances; good enough to test mechanics.
+
+---
+
+## 6 Metadata Store for Code Chunks (`agent/retrieval/metadata.py`)
+
+### 6.1 Goals
+
+* Keep an **in-memory mapping** of `chunk_id → {file_path, start_line, end_line, text}`.
+* Persist this mapping to disk so we can reconstruct context when returning results to the agent.
+
+We’ll store metadata in:
+
+```
+bm25_index/
+└─ metadata.pkl
+```
+
+…but that only has `{file_path, start_line, end_line}`. We also want to **persist the chunk’s `text`** so we can load it later without re-chunking. Let’s:
+
+* Create a new file: `bm25_index/chunk_texts.pkl` that maps `chunk_id → text`.
+
+### 6.2 Update `bm25_index.py` to also save chunk texts
+
+Modify `build_index`:
+
+```diff
+         self.vectorizer = TfidfVectorizer(
+             ngram_range=tuple(settings.retrieval["bm25"]["ngram_range"]),
+             max_features=settings.retrieval["bm25"]["max_features"],
+             norm="l2",
+             use_idf=True,
+             smooth_idf=True,
+             sublinear_tf=True
+         )
+-        self.matrix = self.vectorizer.fit_transform(all_texts)
++        self.matrix = self.vectorizer.fit_transform(all_texts)
+
++        # Save chunk_texts mapping
++        chunk_texts = {idx: all_texts[idx] for idx in range(len(all_texts))}
++        with open(INDEX_DIR / "chunk_texts.pkl", "wb") as fh:
++            pickle.dump(chunk_texts, fh)
+```
+
+When loading, also load `chunk_texts`:
+
+```diff
+     def _load_index(self) -> None:
+         """
+         Load pre-built vectorizer, matrix, and metadata from disk.
+         """
+-        self.vectorizer = joblib.load(VECTORIZER_PATH)
+-        self.matrix = joblib.load(MATRIX_PATH)
+-        with open(METADATA_PATH, "rb") as fh:
+-            self.metadata = pickle.load(fh)
++        self.vectorizer = joblib.load(VECTORIZER_PATH)
++        self.matrix = joblib.load(MATRIX_PATH)
++        with open(METADATA_PATH, "rb") as fh:
++            self.metadata = pickle.load(fh)
++        with open(INDEX_DIR / "chunk_texts.pkl", "rb") as fh:
++            self.chunk_texts = pickle.load(fh)
+```
+
+Finally, **expose a helper** to retrieve chunk text by ID:
+
+```python
+     def get_chunk_text(self, chunk_id: int) -> str:
+         return self.chunk_texts.get(chunk_id, "")
+```
+
+> **Now** we have for each `chunk_id`:
+>
+> * `self.metadata[chunk_id]`: `{file_path, start_line, end_line}`
+> * `self.chunk_texts[chunk_id]`: actual code snippet text
+
+---
+
+## 7 Retrieval Orchestrator (`agent/retrieval/orchestrator.py`)
+
+### 7.1 Goals
+
+* Provide a single class `HybridRetriever` that:
+
+  1. On initialization, instantiates:
+
+     * A `BM25Index` object (built or loaded).
+     * A Chroma “codebase” collection (create if missing).
+  2. Exposes `index_codebase(root_dir: Path)` to build both BM25 and vector indices from scratch:
+
+     * For each chunk (via `chunk_file`):
+
+       * Insert chunk metadata/text into BM25 (already done).
+       * Compute embedding via `embed_text(chunk_text)`.
+       * Insert embedding into Chroma “codebase” with metadata.
+  3. Exposes `fetch_context(query: str, top_n: int)` that:
+
+     * Runs `bm25_results = bm25.query(query, top_k)` (e.g., top 50).
+     * For each `chunk_id` in `bm25_results`, retrieve `text` and compute embedding (or reuse a stored embedding if available).
+     * Rerank those top 50 by vector similarity (Chroma query on `query` embedding).
+     * Return top `top_n` chunks as a list of dicts:
+
+       ```python
+       {
+         "file_path": "...",
+         "start_line": int,
+         "end_line": int,
+         "text": "...",
+         "score": float
+       }
+       ```
+  4. Allows incremental updates when a file changes (CLI or hook can call `update_file(file_path)` to re-chunk, re-embed, and update both indices).
+
+### 7.2 Implementation of `agent/retrieval/orchestrator.py`
+
+```python
+# coding-agent/agent/retrieval/orchestrator.py
+
+import pickle
+from pathlib import Path
+from typing import List, Dict, Any
+
+import chromadb
+from chromadb.config import Settings as ChromaSettings
+
+from agent.config import get_settings
+from agent.retrieval.bm25_index import BM25Index, INDEX_DIR
+from agent.retrieval.chunker import chunk_file
+from agent.retrieval.embedder import embed_text
+
+# --------------------------------------------------------------------------------
+# HybridRetriever: Combines BM25 & vector retrieval for “codebase”
+# --------------------------------------------------------------------------------
+
+class HybridRetriever:
+    def __init__(self):
+        self.settings = get_settings()
+        # 1. BM25 index
+        self.bm25 = BM25Index()
+
+        # 2. Chroma client for codebase collection
+        persist_dir = self.settings.agent_home + "/embeddings"
+        self.client = chromadb.Client(ChromaSettings(
+            chroma_db_impl="duckdb+parquet",
+            persist_directory=persist_dir
+        ))
+        try:
+            self.code_col = self.client.get_collection(name=self.settings.retrieval["embeddings"]["collection_name"])
+        except Exception:
+            self.code_col = self.client.create_collection(name=self.settings.retrieval["embeddings"]["collection_name"])
+
+        # Load chunk_texts from BM25 metadata (so we don’t re-chunk later)
+        with open(INDEX_DIR / "chunk_texts.pkl", "rb") as fh:
+            self.chunk_texts = pickle.load(fh)
+
+    def index_codebase(self, root_dir: Path) -> None:
+        """
+        Build BM25 index and Chroma codebase embeddings from scratch.
+        """
+        # 1. BM25 build: also saves chunk_texts.pkl
+        self.bm25.build_index(root_dir)
+
+        # 2. Insert embeddings for each chunk
+        # Note: BM25 metadata has chunk_id → {file_path, start_line, end_line}
+        for chunk_id, meta in self.bm25.metadata.items():
+            chunk_text = self.chunk_texts[chunk_id]
+            embedding = embed_text(chunk_text)
+            # Metadata for Chroma: include file_path, lines, chunk_id
+            data = {
+                "file_path": meta["file_path"],
+                "start_line": meta["start_line"],
+                "end_line": meta["end_line"],
+                "chunk_id": chunk_id
+            }
+            # Use chunk_id as the Chroma document id (must be string)
+            self.code_col.add(
+                ids=[str(chunk_id)],
+                embeddings=[embedding],
+                metadatas=[data],
+                documents=[chunk_text]
+            )
+
+    def fetch_context(self, query: str, top_n: int = 5, bm25_k: int = 50) -> List[Dict[str, Any]]:
+        """
+        Hybrid retrieval: 
+          1. BM25 → get top bm25_k chunks.
+          2. Get embeddings for query + those chunks.
+          3. Rerank by vector similarity via Chroma query.
+        Returns top_n chunks with metadata and score.
+        """
+        # 1. BM25 step
+        bm25_results = self.bm25.query(query, top_n=bm25_k)
+        candidate_ids = [cid for cid, _score in bm25_results]
+
+        # 2. Use Chroma to rerank: 
+        #    Query Chroma for top_n among candidate_ids only.
+        #    Unfortunately, Chroma’s API doesn’t support restricting to a subset directly.
+        #    Workaround: retrieve all candidate embeddings, compute similarity client-side.
+
+        # Fetch embeddings of candidates
+        # Chroma query by IDs to get embeddings
+        res = self.code_col.get(ids=[str(cid) for cid in candidate_ids], include=["embeddings", "metadatas", "documents"])
+        docs = res["documents"]
+        metas = res["metadatas"]
+        embs = res["embeddings"]
+
+        # Compute query embedding
+        q_emb = embed_text(query)
+
+        # Compute cosine similarity manually
+        from numpy import array, dot
+        from numpy.linalg import norm
+
+        scores = []
+        for idx, emb in enumerate(embs):
+            # emb and q_emb are lists of floats
+            emb_arr = array(emb)
+            q_arr = array(q_emb)
+            # Avoid zero-division
+            if norm(emb_arr) == 0 or norm(q_arr) == 0:
+                sim = 0.0
+            else:
+                sim = float(dot(emb_arr, q_arr) / (norm(emb_arr) * norm(q_arr)))
+            scores.append((candidate_ids[idx], sim))
+
+        # Sort by sim desc
+        scores.sort(key=lambda x: x[1], reverse=True)
+        top_scores = scores[:top_n]
+
+        # Build return objects
+        results: List[Dict[str, Any]] = []
+        for cid, score in top_scores:
+            meta = self.bm25.metadata[cid]
+            text = self.chunk_texts[cid]
+            results.append({
+                "chunk_id": cid,
+                "file_path": meta["file_path"],
+                "start_line": meta["start_line"],
+                "end_line": meta["end_line"],
+                "text": text,
+                "score": score
+            })
+        return results
+
+    def update_file(self, file_path: Path) -> None:
+        """
+        Recompute chunks and embeddings for the given file only, updating both BM25 and Chroma.
+        Steps:
+          1. Identify old chunk_ids belonging to file_path; delete them from BM25 and Chroma.
+          2. Chunk new file → get new chunks with new chunk_ids. 
+             (For simplicity, build BM25 index from scratch: Phase V will optimize incremental BM25.)
+          3. Insert new embeddings for each chunk.
+        """
+        # Simplest: rebuild entire codebase index (slow). 
+        # Advanced: implement incremental deletes/inserts.
+
+        # For Phase IV: just call index_codebase from root_dir again.
+        root_dir = Path(self.settings.agent_home)
+        self.index_codebase(root_dir)
+```
+
+> **Explanation of Steps**
+>
+> * **Constructor**:
+>
+>   1. Instantiates `BM25Index`. If persisted index exists, it loads it; else, you must call `index_codebase` first.
+>   2. Connects to Chroma client, fetches or creates “codebase” collection.
+>   3. Loads `chunk_texts.pkl` from BM25 index.
+> * **`index_codebase(root_dir)`**:
+>
+>   1. Builds BM25 index via `self.bm25.build_index(root_dir)`.
+>   2. Iterates over `self.bm25.metadata`, retrieves each chunk’s text from `self.chunk_texts`, calls `embed_text(chunk_text)`, and inserts `(chunk_id, embedding, metadata, document)` into Chroma.
+> * **`fetch_context(query, top_n, bm25_k)`**:
+>
+>   1. BM25 query: returns `[(chunk_id, bm25_score), ... top_k]`.
+>   2. Fetch corresponding embeddings from Chroma (via `get(ids=...)`).
+>   3. Compute cosine similarity between `query_embedding` and each chunk embedding.
+>   4. Sort by similarity, take top `top_n`.
+>   5. Return a list of dicts: `{chunk_id, file_path, start_line, end_line, text, score}`.
+> * **`update_file(file_path)`**: simplistic reindex approach for Phase IV. Later phases will refine incremental updates.
+
+---
+
+## 8 Auto-Reindex on Git Commits
+
+We want to **automatically update** both BM25 and vector indices whenever code changes. The simplest approach (Phase IV) is to add a **git hook** that runs `HybridRetriever.index_codebase()` on every commit. For large repos, you can optimize later; for now, full reindex is acceptable.
+
+### 8.1 Create `ops/git_hooks/post-commit`
+
+```bash
+#!/usr/bin/env bash
+#
+# coding-agent/ops/git_hooks/post-commit
+#
+# After any commit, reindex codebase.
+#
+echo "Reindexing codebase for retrieval..."
+python3 - <<'EOF'
+import os
+from pathlib import Path
+from agent.retrieval.orchestrator import HybridRetriever
+
+# Assume hook is run from repo root
+repo_root = Path(os.getcwd())
+retriever = HybridRetriever()
+retriever.index_codebase(repo_root)
+EOF
+```
+
+* Make it executable:
+
+```bash
+chmod +x ops/git_hooks/post-commit
+```
+
+* Install the hook into `.git/hooks`:
+
+```bash
+ln -s ../../ops/git_hooks/post-commit .git/hooks/post-commit
+```
+
+> **Note:**
+>
+> * We assume `python3` resolves to the poetry venv; if not, replace with `poetry run python3`.
+> * On each commit, we rebuild BM25 and re-embed everything. This can be slow for medium–large repos but is acceptable for Phase IV. Optimize in Phase VII.
+
+---
+
+## 9 Tests for Retrieval (`tests/test_retrieval.py`)
+
+We’ll create a small **temporary repo** with a few Python files to test:
+
+1. **Indexing** – after running `index_codebase`, BM25 and Chroma collections contain expected chunks.
+2. **BM25 Query** – a query matching a known snippet returns correct chunk\_id.
+3. **Hybrid Fetch** – `fetch_context` returns a chunk with expected file path and line numbers.
+
+### 9.1 `tests/test_retrieval.py`
+
+```python
+# coding-agent/tests/test_retrieval.py
+
+import os
+import sys
+import shutil
+import tempfile
+import pytest
+from pathlib import Path
+
+from agent.retrieval.orchestrator import HybridRetriever
+
+@pytest.fixture(scope="function")
+def temp_repo(tmp_path, monkeypatch):
+    """
+    Create a temporary codebase with two small Python files:
+      - hello.py containing a function 'def greet(): return "hello"'
+      - math_utils.py containing 'def add(a, b): return a + b'
+    Then monkeypatch agent_home to this temp dir.
+    """
+    # Create directory structure
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    # Create hello.py
+    hello = repo / "hello.py"
+    hello.write_text("def greet():\n    return 'hello'\n")
+    # Create math_utils.py
+    math_utils = repo / "math_utils.py"
+    math_utils.write_text("def add(a, b):\n    return a + b\n")
+    # Create .agent.yml with minimal config
+    agent_yml = repo / ".agent.yml"
+    agent_yml.write_text("""
+openai_api_key: ""
+anthropic_api_key: ""
+cost_cap_daily: 20.0
+memory_summarise_threshold: 1000
+tools_allowed:
+  - read_file
+  - write_diff
+  - run_tests
+  - static_analyze
+  - grep
+  - vector_search
+retrieval:
+  bm25:
+    index_dir: "bm25_index"
+    ngram_range: [1, 1]
+    max_features: 1000
+  chunker:
+    max_tokens: 100
+    overlap_tokens: 10
+  embeddings:
+    collection_name: "codebase"
+    model: "stub"
+""")
+    # Monkeypatch agent_home to repo
+    monkeypatch.setenv("AGENT_HOME", str(repo))
+    return repo
+
+def test_index_and_bm25_query(temp_repo):
+    os.chdir(temp_repo)
+    retriever = HybridRetriever()
+    retriever.index_codebase(temp_repo)
+
+    # BM25 index files should exist in bm25_index/
+    bm25_dir = temp_repo / "bm25_index"
+    assert bm25_dir.exists()
+    assert (bm25_dir / "vectorizer.joblib").exists()
+    assert (bm25_dir / "matrix.npz").exists()
+    assert (bm25_dir / "metadata.pkl").exists()
+    assert (bm25_dir / "chunk_texts.pkl").exists()
+
+    # Query BM25 for "greet"
+    results = retriever.bm25.query("greet", top_n=1)
+    assert len(results) == 1
+    chunk_id, score = results[0]
+    meta = retriever.bm25.metadata[chunk_id]
+    assert meta["file_path"] == "hello.py"
+    # Ensure that chunk covers line numbers including 'def greet()'
+    assert meta["start_line"] == 1
+
+def test_hybrid_fetch(temp_repo):
+    os.chdir(temp_repo)
+    retriever = HybridRetriever()
+    retriever.index_codebase(temp_repo)
+
+    # fetch_context for "add numbers"
+    # Expect to retrieve chunk from math_utils.py
+    res_list = retriever.fetch_context("add numbers", top_n=1, bm25_k=2)
+    assert len(res_list) == 1
+    item = res_list[0]
+    assert item["file_path"] == "math_utils.py"
+    assert "add(a, b)" in item["text"]
+
+def test_chroma_collection(temp_repo):
+    os.chdir(temp_repo)
+    retriever = HybridRetriever()
+    retriever.index_codebase(temp_repo)
+
+    # Directly query Chroma for chunk 'greet'
+    # We know chunk_id for greet is in metadata where file_path == "hello.py"
+    greet_chunk_ids = [cid for cid, m in retriever.bm25.metadata.items() if m["file_path"] == "hello.py"]
+    assert len(greet_chunk_ids) >= 1
+    cid = greet_chunk_ids[0]
+    # Fetch from Chroma by id
+    col = retriever.code_col
+    result = col.get(ids=[str(cid)], include=["metadatas", "documents"])
+    assert result["documents"][0].startswith("def greet")
+
+```
+
+> **Explanation of Test Cases**
+>
+> * **`test_index_and_bm25_query`**:
+>
+>   1. Create a temp repo, write two files.
+>   2. Monkeypatch `AGENT_HOME` to that repo, so `get_settings().agent_home` points correctly.
+>   3. Initialize `HybridRetriever`, call `index_codebase()`.
+>   4. Check bm25 index files exist in `<repo>/bm25_index/`.
+>   5. Query `bm25.query("greet")`, assert returned chunk metadata points to `hello.py` at line 1.
+> * **`test_hybrid_fetch`**:
+>
+>   1. Call `fetch_context("add numbers", top_n=1)`.
+>   2. Verify returned chunk’s `file_path` is `math_utils.py` and `text` contains `add(a, b)`.
+> * **`test_chroma_collection`**:
+>
+>   1. After `index_codebase()`, find `chunk_id` for `hello.py`.
+>   2. Use `retriever.code_col.get(ids=[cid])` to fetch stored document and metadata.
+>   3. Assert `documents[0]` begins with `def greet`.
+
+Run tests:
+
+```bash
+poetry run pytest -q
+```
+
+You should see all tests passing, indicating BM25 files built correctly, `fetch_context` works, and Chroma collection stored documents.
+
+---
+
+## 10 Developer Walkthrough for Phase IV
+
+1. **Ensure Dependencies Installed**
+
+   ```bash
+   poetry install
+   poetry shell
+   ```
+
+2. **Create a sample codebase**
+
+   ```bash
+   mkdir demo_retrieval
+   cd demo_retrieval
+   echo "def foo():\n    return 42" > foo.py
+   echo "def bar(x):\n    return x * 2" > bar.py
+   ```
+
+3. **Prepare `.agent.yml`**
+
+   ```yaml
+   openai_api_key: ""
+   anthropic_api_key: ""
+   cost_cap_daily: 20.0
+   memory_summarise_threshold: 1000
+
+   tools_allowed:
+     - read_file
+     - write_diff
+     - run_tests
+     - static_analyze
+     - grep
+     - vector_search
+
+   retrieval:
+     bm25:
+       index_dir: "bm25_index"
+       ngram_range: [1, 1]
+       max_features: 1000
+     chunker:
+       max_tokens: 50
+       overlap_tokens: 5
+     embeddings:
+       collection_name: "codebase"
+       model: "stub"
+   ```
+
+   (Save as `demo_retrieval/.agent.yml`.)
+
+4. **Initialize HybridRetriever**
+
+   ```python
+   >>> from agent.retrieval.orchestrator import HybridRetriever
+   >>> retriever = HybridRetriever()
+   # At first, BM25 index doesn’t exist → must build
+   >>> retriever.index_codebase(Path.cwd())
+   # Inspect BM25 folder
+   >>> (Path.cwd() / "bm25_index").ls()
+   # Should list vectorizer.joblib, matrix.npz, metadata.pkl, chunk_texts.pkl
+   # Inspect Chroma collection size
+   >>> len(retriever.code_col.get()["ids"])
+   # Should be equal to total number of chunks
+
+   # Query BM25 directly
+   >>> top = retriever.bm25.query("foo", top_n=1)
+   >>> top
+   [(0, 0.87)]
+   >>> chunk_id = top[0][0]
+   >>> retriever.bm25.metadata[chunk_id]
+   {'file_path': 'foo.py', 'start_line': 1, 'end_line': 2}
+   >>> retriever.chunk_texts[chunk_id]
+   'def foo():\n    return 42\n'
+
+   # Hybrid fetch
+   >>> res = retriever.fetch_context("double the value", top_n=1)
+   >>> res
+   [{'chunk_id': 1, 'file_path': 'bar.py', 'start_line': 1, 'end_line': 2, 'text': 'def bar(x):\n    return x * 2\n', 'score': 0.0}]
+   ```
+
+5. **Commit Hook Test**
+
+   ```bash
+   # In demo_retrieval repo (with hook installed in .git/hooks)
+   git init -b main
+   git add foo.py bar.py .agent.yml
+   git commit -m "Initial code"
+   # The post-commit hook fires and rebuilds retrieval index
+   ls bm25_index
+   # Should show index files
+   ```
+
+---
+
+## 11 Phase IV Exit Criteria
+
+Check off all of these before moving on:
+
+* [ ] **BM25 Index Built**: After `index_codebase`, `bm25_index/` contains `vectorizer.joblib`, `matrix.npz`, `metadata.pkl`, and `chunk_texts.pkl`.
+* [ ] **BM25 Query Works**: `bm25.query("keyword", top_n=1)` returns a valid `(chunk_id, score)` tuple whose metadata matches expected file and lines.
+* [ ] **Chroma Codebase Collection**: After `index_codebase`, `codebase` collection exists in Chroma, and retrieved `documents` match snippet text.
+* [ ] **Hybrid Fetch**: `fetch_context(query, top_n, bm25_k)` returns correct top `n` chunks for test queries.
+* [ ] **Git Hook Rebuild**: Committing new code under a repo with the hook triggers reindex (inspect `bm25_index/`).
+* [ ] **Smoke Tests Passing**: `pytest -q` passes `test_retrieval.py` (and earlier tests).
+
+With Phase IV complete, you have a **Hybrid Retrieval Layer** combining BM25 and vector embeddings, ready to serve relevant code chunks to any Planner or Executor. In the next phase (V), we’ll build the **Task Object & Planner Module**, making use of `fetch_context` to feed context into planning.

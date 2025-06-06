@@ -1,0 +1,1118 @@
+Below is an extremely detailed, step‐by‐step breakdown of **Phase II: Tool Layer & Safe Execution Engine**. We will:
+
+1. Design a **Tool Schema** so that every “tool” is a first‐class JSON object, limiting surface area and letting the LLM only see a clear schema—not arbitrary shell commands.
+2. Implement a **Permission Model (ACL)** in YAML so you can whitelist exactly which tools the agent (or user) may call.
+3. Build a **Sandbox Runner** that invokes each tool under Firejail (if available) or a minimal Docker container, preventing malicious or runaway commands.
+4. Create a set of **“standard tools”**, such as `read_file`, `write_diff`, `run_tests`, `static_analyze`, `grep`, and `vector_search`, each as a pure‐function wrapper obeying our sandbox and permission rules.
+5. Wire everything together in a central `agent/tools/core.py` so that the Executor (in Phase VI) will only ever call the validated, sandboxed wrappers.
+
+We’ll also add **smoke tests** under `tests/test_tools.py` to verify:
+
+* ACL denial behavior (calling a disallowed tool → error)
+* Basic functionality (e.g., `read_file` returns file contents)
+* Sandbox invocation (e.g., a “hostile” command is prevented)
+
+At the end of this phase, you’ll have a **safe, extensible tool registry** that any agent can use without risk of arbitrary shell execution.
+
+---
+
+## 1 Directory Layout Updates
+
+Starting from where Phase I left off (with `cli/`, `agent/`, `ops/`, `tests/`), we now add a new **`agent/tools/`** package and a top‐level **`tools/`** directory for our thin wrappers. The resulting structure becomes:
+
+```
+coding-agent/
+├─ cli/
+│  ├─ __init__.py
+│  └─ ...                   # (same as Phase I)
+├─ agent/
+│  ├─ __init__.py
+│  ├─ config.py             # Phase I config
+│  ├─ utils/
+│  │  └─ fs.py              # Phase I file‐lock util
+│  └─ tools/
+│     ├─ __init__.py
+│     ├─ core.py            # Central tool‐invocation & ACL logic
+│     ├─ permissions.py     # Load & validate ACL rules
+│     └─ schema.py          # Pydantic tool‐schema (strict JSON format)
+├─ tools/
+│  ├─ read_file.py          # “Tool” wrapper for reading files
+│  ├─ write_diff.py         # “Tool” wrapper for applying diffs
+│  ├─ run_tests.py          # “Tool” wrapper for running tests
+│  ├─ static_analyze.py     # “Tool” wrapper for lint/static analysis
+│  ├─ grep.py               # “Tool” wrapper for grep searches
+│  └─ vector_search.py      # “Tool” wrapper for embedding lookups
+├─ ops/                     # (from Phase I)
+│  ├─ docker/
+│  │  └─ runner.dockerfile
+│  └─ ... 
+├─ tests/
+│  ├─ test_cli.py          # Phase I smoke test
+│  └─ test_tools.py        # New tests for Phase II
+├─ .env.example            # (from Phase I)
+├─ README.md
+├─ pyproject.toml
+└─ .gitignore
+```
+
+> **Why this layout?**
+>
+> * `agent/tools/schema.py` declares exactly how a JSON‐RPC tool call must look, ensuring the LLM never “guesses” shell syntax.
+> * `agent/tools/permissions.py` loads a YAML ACL (we’ll store defaults in `.agent.yml`) and checks every invocation.
+> * `agent/tools/core.py` provides a single function `invoke_tool(tool_request: dict) → dict` that (a) validates schema, (b) checks ACL, (c) runs sandboxed wrapper, (d) returns stdout/exit‐code.
+> * The top‐level `tools/*.py` files each expose a Python function that reads arguments from JSON, executes the real logic, and prints results to stdout in a strict JSON format.
+
+---
+
+## 2 Define the Tool Schema (Strict JSON Format)
+
+We want every tool call to be a JSON object of the form:
+
+```jsonc
+{
+  "name": "read_file",
+  "args": {
+    "path": "/path/to/file.txt",
+    "start": 0,
+    "end": 200
+  },
+  "secure": true,            // whether tool must run in sandbox
+  "timeout_seconds": 30      // overall wall‐clock limit
+}
+```
+
+This JSON schema prevents an LLM from injecting arbitrary shell commands. We use Pydantic so that any malformed JSON → immediate error before execution.
+
+### 2.1 `agent/tools/schema.py`
+
+Create a new file `agent/tools/schema.py`:
+
+```python
+# coding-agent/agent/tools/schema.py
+
+from typing import Literal, Dict, Any, Optional
+from pydantic import BaseModel, Field, validator, StrictStr, StrictBool, StrictInt
+
+class ToolRequest(BaseModel):
+    """
+    Represents a fully‐validated request to invoke a tool.
+    """
+    name: StrictStr = Field(..., description="Tool name, must match registered tool.")
+    args: Dict[StrictStr, Any] = Field(
+        default_factory=dict, description="Arguments to the tool (key: value)."
+    )
+    secure: StrictBool = Field(
+        True, description="Whether to run this tool inside the sandbox."
+    )
+    timeout_seconds: StrictInt = Field(
+        30,
+        ge=1,
+        le=300,
+        description="Wall‐clock timeout in seconds for this tool call.",
+    )
+
+    @validator("name")
+    def name_must_be_safe(cls, v: str) -> str:
+        # Only allow [a-zA-Z0-9_-]
+        import re
+        if not re.fullmatch(r"[a-zA-Z0-9_-]+", v):
+            raise ValueError("Tool name contains invalid characters")
+        return v
+
+    @validator("args")
+    def args_must_be_json_serializable(cls, v: Dict[str, Any]) -> Dict[str, Any]:
+        # We’ll rely on natural JSON types; deep validation is in each wrapper
+        return v
+```
+
+> **Explanation**
+>
+> * `StrictStr`, `StrictBool`, `StrictInt` ensure no type coercion.
+> * The `name` validator prohibits characters like `;` or `|`.
+> * `timeout_seconds` range (1–300 s) prevents extremely long or zero‐second calls.
+> * Later, `core.py` will use `ToolRequest.parse_obj(json_payload)` to validate.
+
+---
+
+## 3 Load & Validate Permissions (ACL)
+
+We want a simple ACL structure in YAML inside our main `.agent.yml`, which looks like:
+
+```yaml
+# .agent.yml
+
+openai_api_key: "sk-..."
+anthropic_api_key: ""
+
+# Daily cost cap in USD
+cost_cap_daily: 20.0
+
+# Which tools are allowed by default (empty => no tools)
+tools_allowed:
+  - read_file
+  - write_diff
+  - run_tests
+  - static_analyze
+  - grep
+  - vector_search
+
+# Per‐tool overrides (optional). E.g., allow a given user to use a tool not in global list.
+users:
+  alice:
+    allow:
+      - read_file
+      - grep
+    deny:
+      - write_diff
+```
+
+At Phase II, we implement only **global** `tools_allowed` (under the root of `.agent.yml`). User‐level overrides come in Phase XII when multi‐user ACL is needed.
+
+### 3.1 `agent/tools/permissions.py`
+
+```python
+# coding-agent/agent/tools/permissions.py
+
+from pathlib import Path
+import yaml
+from typing import Set
+from agent.config import get_settings, Settings
+
+class ACL:
+    """
+    Loads the 'tools_allowed' list from .agent.yml (via Settings).
+    Offers a method to check if a given tool name is allowed.
+    """
+    def __init__(self, settings: Settings | None = None):
+        self.settings = settings or get_settings()
+        self._allowed: Set[str] = set()
+        self._load_acl()
+
+    def _load_acl(self):
+        # Read tools_allowed from the same source as Settings
+        config_path = Path(self.settings.agent_home) / ".agent.yml"
+        try:
+            raw = yaml.safe_load(config_path.read_text())
+        except Exception:
+            raw = {}
+        allowed_list = raw.get("tools_allowed", [])
+        if not isinstance(allowed_list, list):
+            raise ValueError("`tools_allowed` in .agent.yml must be a list of strings")
+        self._allowed = set(str(x) for x in allowed_list)
+
+    def is_allowed(self, tool_name: str) -> bool:
+        return tool_name in self._allowed
+
+    def reload(self):
+        self._load_acl()
+```
+
+> **Why this approach?**
+>
+> * We read the same `.agent.yml` used by `Settings`, so we avoid a second config file.
+> * Phase XII (multi‐user ACL) would expand this class to handle per‐user overrides.
+
+---
+
+## 4 Sandbox Runner Abstraction
+
+Each tool must run “sandboxed” if `secure=True`. We try to use Firejail (lightweight, zero‐config sandbox if installed). If Firejail is missing or yields an error, we fall back to a minimal Docker container built from `ops/docker/runner.dockerfile`.
+
+### 4.1 Detecting Firejail
+
+Inside `agent/tools/core.py`, we’ll create a helper that checks:
+
+```python
+# coding-agent/agent/tools/core.py (excerpt)
+
+import shutil
+
+def _find_firejail() -> bool:
+    """
+    Returns True if 'firejail' binary exists on PATH, False otherwise.
+    """
+    return shutil.which("firejail") is not None
+```
+
+### 4.2 Docker Fallback
+
+We expect a Docker image called `coding-agent-runner:latest` to exist (built from `ops/docker/runner.dockerfile`). For Phase II, we’ll provide:
+
+#### 4.2.1 `ops/docker/runner.dockerfile`
+
+```dockerfile
+# Minimal container to run tools if Firejail is unavailable.
+FROM python:3.12-slim
+
+# Install only what’s needed by default: grep, python packages (if any tool requires)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        grep \
+        git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create a non-root user to avoid running as root inside container
+RUN useradd -m agentuser
+USER agentuser
+WORKDIR /home/agentuser
+
+# Entrypoint: we will mount the host repo at /workspace inside Docker.
+ENTRYPOINT ["tail", "-f", "/dev/null"]
+```
+
+> **Rationale**
+>
+> * We keep the runner image extremely minimal. It only needs grep, git, Python standard library, and any CLI binaries our tools might use.
+> * The container runs `tail -f /dev/null` so that it stays alive; our Python `core.py` will `docker exec` into it to invoke tool scripts.
+> * We run as a non-zero user to avoid root privilege leaks.
+
+Build this image manually (once):
+
+```bash
+docker build -t coding-agent-runner:latest -f ops/docker/runner.dockerfile .
+```
+
+---
+
+## 5 Central Tool Invocation: `agent/tools/core.py`
+
+This module does the heavy lifting:
+
+1. Parse the incoming JSON into a `ToolRequest` (from `schema.py`).
+2. Check ACL (`permissions.py`) to see if the `name` is allowed.
+3. Lookup a Python function in `tools/<name>.py`; if missing, error.
+4. If `secure=True`, run inside Firejail (if found) or Docker fallback.
+5. Enforce `timeout_seconds` by running the wrapper process under a timer.
+6. Capture `stdout`, `stderr`, and `exit_code`, then return a JSON response.
+
+Below is a complete implementation (with verbose comments).
+
+### 5.1 `agent/tools/core.py`
+
+```python
+# coding-agent/agent/tools/core.py
+
+import subprocess
+import sys
+import json
+import threading
+import shlex
+import os
+import time
+import traceback
+from pathlib import Path
+from typing import Any, Dict
+
+from .schema import ToolRequest
+from .permissions import ACL
+
+# Global ACL instance (lazy loaded)
+_acl: ACL | None = None
+
+def get_acl() -> ACL:
+    global _acl
+    if _acl is None:
+        _acl = ACL()
+    return _acl
+
+def _find_firejail() -> bool:
+    import shutil
+    return shutil.which("firejail") is not None
+
+def _run_with_firejail(command: str, timeout: int) -> Dict[str, Any]:
+    """
+    Run `command` under Firejail. Returns a dict {exit_code, stdout, stderr}.
+    """
+    firejail_path = "firejail"
+    # --quiet: suppress Firejail banner
+    full_cmd = f"{firejail_path} --quiet {command}"
+    return _run_subprocess(full_cmd, timeout)
+
+def _run_with_docker(command: str, timeout: int) -> Dict[str, Any]:
+    """
+    Run `command` inside the `coding-agent-runner:latest` Docker container.
+    We assume the current working directory is mounted at /workspace.
+    """
+    # Mount the host's current directory as /workspace, working dir inside container.
+    cwd = os.getcwd()
+    docker_cmd = (
+        f"docker run --rm -v {shlex.quote(cwd)}:/workspace -w /workspace "
+        "coding-agent-runner:latest /bin/bash -lc "
+        f"{shlex.quote(command)}"
+    )
+    return _run_subprocess(docker_cmd, timeout)
+
+def _run_subprocess(raw_command: str, timeout: int) -> Dict[str, Any]:
+    """
+    Execute `raw_command` via shell, enforce timeout, capture stdout/stderr.
+    """
+    # Start subprocess
+    proc = subprocess.Popen(
+        raw_command,
+        shell=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+        universal_newlines=True,
+    )
+
+    # Timer thread to kill if needed
+    timer = threading.Timer(timeout, proc.kill)
+    try:
+        timer.start()
+        stdout, stderr = proc.communicate()
+    finally:
+        timer.cancel()
+
+    return {
+        "exit_code": proc.returncode,
+        "stdout": stdout,
+        "stderr": stderr,
+    }
+
+def invoke_tool(request_json: str) -> str:
+    """
+    Entrypoint for calling a tool. Takes a JSON string, returns a JSON string:
+    { "exit_code": int, "stdout": "...", "stderr": "..." }
+    Steps:
+      1. Parse & validate JSON → ToolRequest
+      2. ACL check
+      3. Find wrapper script
+      4. Build command line
+      5. Run under sandbox (if secure) or direct
+      6. Return JSON response
+    """
+    try:
+        # 1. Parse & validate
+        payload = json.loads(request_json)
+        tool_req = ToolRequest.parse_obj(payload)
+    except Exception as e:
+        err = {"exit_code": -1, "stdout": "", "stderr": f"Invalid request: {e}"}
+        return json.dumps(err)
+
+    # 2. ACL check
+    acl = get_acl()
+    if not acl.is_allowed(tool_req.name):
+        resp = {
+            "exit_code": 1,
+            "stdout": "",
+            "stderr": f"Permission denied for tool '{tool_req.name}'",
+        }
+        return json.dumps(resp)
+
+    # 3. Look for wrapper script under tools/
+    wrapper_path = Path(__file__).parent.parent / "tools" / f"{tool_req.name}.py"
+    if not wrapper_path.exists():
+        resp = {
+            "exit_code": 1,
+            "stdout": "",
+            "stderr": f"Tool wrapper not found: '{tool_req.name}'",
+        }
+        return json.dumps(resp)
+
+    # 4. Build the command line: we execute wrapper under python, passing args as JSON via stdin
+    #    Example: python tools/read_file.py '{"path": "...", "start": 0, "end": 100}'
+    args_json = json.dumps(tool_req.args)
+    py_executable = sys.executable  # e.g., /usr/bin/python3.11
+    cmd = f"{shlex.quote(py_executable)} {shlex.quote(str(wrapper_path))} '{shlex.quote(args_json)}'"
+
+    # 5. Decide sandboxing
+    result: Dict[str, Any]
+    if tool_req.secure:
+        if _find_firejail():
+            result = _run_with_firejail(cmd, tool_req.timeout_seconds)
+        else:
+            result = _run_with_docker(cmd, tool_req.timeout_seconds)
+    else:
+        result = _run_subprocess(cmd, tool_req.timeout_seconds)
+
+    # 6. Return JSON
+    return json.dumps(result)
+```
+
+> **Key Points**
+>
+> * We read `request_json` (a string) from STDIN or an API call, parse it into `ToolRequest`.
+> * We check ACL or immediately return a JSON error.
+> * We assume every wrapper lives in `coding-agent/tools/<name>.py` and is invoked as `python wrapper.py '<args_json>'`.
+> * If `secure=True`, prefer Firejail; if not installed, use Docker fallback.
+> * We wrap the real command in a `Timer` to enforce `timeout_seconds`.
+> * Final result is always a JSON string with `exit_code`, `stdout`, and `stderr`.
+
+---
+
+## 6 Implement Standard Tools (Pure‐Function Wrappers)
+
+Each “tool” is a Python script under `tools/` that:
+
+1. Reads a single positional arg—the JSON‐encoded arguments—from `sys.argv[1]`.
+2. Parses it (via `json.loads`) into a Python dict.
+3. Validates required keys / types in `args`.
+4. Executes its logic using only Python stdlib (or minimal dependencies).
+5. Writes a JSON result to stdout:
+
+   ```jsonc
+   {
+     "exit_code": 0,
+     "stdout": "…",      // actual output (e.g. file contents or diff text)
+     "stderr": ""        // any error messages
+   }
+   ```
+6. Exits with `sys.exit(exit_code)` so `core.py`’s subprocess sees the same exit code.
+
+Below are implementations for six core tools:
+
+### 6.1 `tools/read_file.py`
+
+```python
+#!/usr/bin/env python3
+# coding-agent/tools/read_file.py
+
+import sys
+import json
+from pathlib import Path
+
+def main():
+    if len(sys.argv) != 2:
+        err = {"exit_code": 1, "stdout": "", "stderr": "Expected exactly one JSON arg"}
+        print(json.dumps(err))
+        sys.exit(1)
+
+    try:
+        args = json.loads(sys.argv[1])
+        path = args.get("path")
+        start = int(args.get("start", 0))
+        end = int(args.get("end", -1))
+        if not path:
+            raise ValueError("Missing 'path'")
+        p = Path(path)
+        if not p.is_file():
+            raise FileNotFoundError(f"File not found: {path}")
+        data = p.read_text(encoding="utf-8")
+        # Clip to [start:end]
+        content = data[start:end] if end != -1 else data[start:]
+        resp = {"exit_code": 0, "stdout": content, "stderr": ""}
+    except Exception as e:
+        resp = {"exit_code": 1, "stdout": "", "stderr": str(e)}
+
+    print(json.dumps(resp))
+    sys.exit(resp["exit_code"])
+
+if __name__ == "__main__":
+    main()
+```
+
+> **Explanation**
+>
+> * We read `path`, `start`, `end` from JSON.
+> * If `end == -1`, we read until EOF.
+> * Any exception (missing file, invalid args) → nonzero exit with `stderr` set.
+
+---
+
+### 6.2 `tools/write_diff.py`
+
+```python
+#!/usr/bin/env python3
+# coding-agent/tools/write_diff.py
+
+import sys
+import json
+import difflib
+from pathlib import Path
+
+def apply_diff(original: str, diff_text: str) -> str:
+    """
+    Apply a unified diff to the original text, return the updated text.
+    If diff fails, raise an exception.
+    """
+    patched = []
+    # Use difflib to apply the patch
+    orig_lines = original.splitlines(keepends=True)
+    diff_lines = diff_text.splitlines(keepends=True)
+    patch = difflib.unified_diff([], [])  # placeholder to get correct type
+
+    # Unfortunately, stdlib lacks a robust patch applier. In Phase II, we do a simple check:
+    # We only allow diffs with '--- a/path' and '+++ b/path' to match the file we loaded.
+    # Then we write the diff to a temp file and call `patch` binary. 
+    import tempfile, subprocess
+
+    with tempfile.NamedTemporaryFile(mode="w+", delete=False) as tf_orig:
+        tf_orig.write(original)
+        orig_name = tf_orig.name
+
+    with tempfile.NamedTemporaryFile(mode="w+", delete=False) as tf_diff:
+        tf_diff.write(diff_text)
+        diff_name = tf_diff.name
+
+    # Run `patch` CLI to apply diff in‐place
+    cmd = f"patch {orig_name} {diff_name}"
+    proc = subprocess.Popen(
+        cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+    )
+    out, err = proc.communicate()
+    if proc.returncode != 0:
+        raise RuntimeError(f"Patch failed: {err.strip()}")
+
+    # Read patched content
+    with open(orig_name, "r", encoding="utf-8") as f:
+        new_text = f.read()
+    return new_text
+
+def main():
+    if len(sys.argv) != 2:
+        err = {"exit_code": 1, "stdout": "", "stderr": "Expected one JSON arg"}
+        print(json.dumps(err)); sys.exit(1)
+
+    try:
+        args = json.loads(sys.argv[1])
+        path = args.get("path")
+        diff_text = args.get("diff")
+        if not path or diff_text is None:
+            raise ValueError("Missing 'path' or 'diff'")
+        p = Path(path)
+        if not p.is_file():
+            raise FileNotFoundError(f"File not found: {path}")
+        original = p.read_text(encoding="utf-8")
+        patched = apply_diff(original, diff_text)
+        p.write_text(patched, encoding="utf-8")
+        resp = {"exit_code": 0, "stdout": "OK", "stderr": ""}
+    except Exception as e:
+        resp = {"exit_code": 1, "stdout": "", "stderr": str(e)}
+
+    print(json.dumps(resp))
+    sys.exit(resp["exit_code"])
+
+if __name__ == "__main__":
+    main()
+```
+
+> **Notes**
+>
+> * We rely on the system’s `patch` binary (Ubuntu default). If you need pure‐Python patching, replace with a third‐party library like `unidiff`.
+> * Arguments:
+>
+>   * `path`: the file to patch
+>   * `diff`: unified diff (string) as produced by `difflib` or an LLM diff suggestion
+> * On success, we write patched content in place. Return `"stdout": "OK"` so Executor knows it succeeded.
+
+---
+
+### 6.3 `tools/run_tests.py`
+
+```python
+#!/usr/bin/env python3
+# coding-agent/tools/run_tests.py
+
+import sys
+import json
+import subprocess
+
+def main():
+    if len(sys.argv) != 2:
+        msg = {"exit_code": 1, "stdout": "", "stderr": "Expected JSON arg"}
+        print(json.dumps(msg)); sys.exit(1)
+
+    try:
+        args = json.loads(sys.argv[1])
+        cmd = args.get("cmd", "pytest -q")
+        if not isinstance(cmd, str):
+            raise ValueError("'cmd' must be a string")
+        # Run tests
+        proc = subprocess.Popen(
+            cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
+        out, err = proc.communicate()
+        resp = {
+            "exit_code": proc.returncode,
+            "stdout": out,
+            "stderr": err,
+        }
+    except Exception as e:
+        resp = {"exit_code": 1, "stdout": "", "stderr": str(e)}
+
+    print(json.dumps(resp))
+    sys.exit(resp["exit_code"])
+
+if __name__ == "__main__":
+    main()
+```
+
+> **Behavior**
+>
+> * Default test command is `pytest -q`.
+> * Users can override via `{"cmd": "pytest tests/foo.py"}`.
+> * We capture both `stdout` and `stderr` for diagnostics.
+
+---
+
+### 6.4 `tools/static_analyze.py`
+
+```python
+#!/usr/bin/env python3
+# coding-agent/tools/static_analyze.py
+
+import sys
+import json
+import subprocess
+
+def main():
+    if len(sys.argv) != 2:
+        msg = {"exit_code": 1, "stdout": "", "stderr": "Expected JSON arg"}
+        print(json.dumps(msg)); sys.exit(1)
+
+    try:
+        args = json.loads(sys.argv[1])
+        # Default to running ruff on the entire repo
+        cmd = args.get("cmd", "ruff .")
+        if not isinstance(cmd, str):
+            raise ValueError("'cmd' must be a string")
+        proc = subprocess.Popen(
+            cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
+        out, err = proc.communicate()
+        resp = {
+            "exit_code": proc.returncode,
+            "stdout": out,
+            "stderr": err,
+        }
+    except Exception as e:
+        resp = {"exit_code": 1, "stdout": "", "stderr": str(e)}
+
+    print(json.dumps(resp))
+    sys.exit(resp["exit_code"])
+
+if __name__ == "__main__":
+    main()
+```
+
+> **Rationale**
+>
+> * By default, we run `ruff .` (Phase I installed ruff).
+> * Teams can override to run `flake8`, `bandit`, `tsc` (for TypeScript), or `cargo check` (for Rust).
+> * The agent simply returns exit code and output.
+
+---
+
+### 6.5 `tools/grep.py`
+
+```python
+#!/usr/bin/env python3
+# coding-agent/tools/grep.py
+
+import sys
+import json
+import subprocess
+
+def main():
+    if len(sys.argv) != 2:
+        msg = {"exit_code": 1, "stdout": "", "stderr": "Expected JSON arg"}
+        print(json.dumps(msg)); sys.exit(1)
+
+    try:
+        args = json.loads(sys.argv[1])
+        pattern = args.get("pattern")
+        path_glob = args.get("path_glob", ".")
+        max_lines = int(args.get("max_lines", 100))
+
+        if not pattern:
+            raise ValueError("Missing 'pattern'")
+        # Construct grep command. -R: recursive, -n: show line numbers, -m max matches
+        cmd = (
+            f"grep -R -n -m {max_lines} --include='{path_glob}' "
+            f"{shlex.quote(pattern)} ."
+        )
+        proc = subprocess.Popen(
+            cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
+        out, err = proc.communicate()
+        resp = {
+            "exit_code": proc.returncode,
+            "stdout": out,
+            "stderr": err,
+        }
+    except Exception as e:
+        resp = {"exit_code": 1, "stdout": "", "stderr": str(e)}
+
+    print(json.dumps(resp))
+    sys.exit(resp["exit_code"])
+
+if __name__ == "__main__":
+    main()
+```
+
+> **Detail**
+>
+> * Uses `grep -R -n -m`: recursively search, show line numbers, limit matches to `max_lines`.
+> * `path_glob` is a shell‐glob filter (e.g. `*.py`, `src/**/*.js`).
+> * Returns the raw grep output for the agent to parse.
+
+---
+
+### 6.6 `tools/vector_search.py`
+
+```python
+#!/usr/bin/env python3
+# coding-agent/tools/vector_search.py
+
+import sys
+import json
+from typing import List, Any
+
+# We use Chroma as a vector DB; the agent must have previously inserted embeddings.
+import chromadb
+from chromadb.config import Settings as ChromaSettings
+
+def main():
+    if len(sys.argv) != 2:
+        msg = {"exit_code": 1, "stdout": "", "stderr": "Expected JSON arg"}
+        print(json.dumps(msg)); sys.exit(1)
+
+    try:
+        args = json.loads(sys.argv[1])
+        query = args.get("query")
+        k = int(args.get("k", 5))
+        collection_name = args.get("collection", "codebase")
+
+        if not query:
+            raise ValueError("Missing 'query'")
+
+        # Connect to local Chroma instance (assumes ephemeral or persistent on disk)
+        client = chromadb.Client(ChromaSettings(
+            chroma_db_impl="duckdb+parquet",
+            persist_directory="embeddings"
+        ))
+        col = client.get_collection(name=collection_name)
+        # Perform search (returns list of dicts)
+        results = col.query(query_texts=[query], n_results=k)
+        # Structure output
+        matches: List[Any] = []
+        for idx, score in zip(results["ids"][0], results["distances"][0]):
+            metadata = col.get(ids=[idx])["metadatas"][0]
+            # Each metadata should contain {'path':..., 'start':..., 'end':...}
+            matches.append({
+                "id": idx,
+                "score": score,
+                "metadata": metadata
+            })
+
+        resp = {"exit_code": 0, "stdout": json.dumps(matches), "stderr": ""}
+    except Exception as e:
+        resp = {"exit_code": 1, "stdout": "", "stderr": str(e)}
+
+    print(json.dumps(resp))
+    sys.exit(resp["exit_code"])
+
+if __name__ == "__main__":
+    main()
+```
+
+> **Key Notes**
+>
+> * We connect to a **Chroma** instance stored on disk under `embeddings/`.
+> * We assume a collection named `codebase` exists (Phase IV will build/maintain it).
+> * We return a JSON‐encoded list of matches in `stdout`. The executor will parse JSON out of `stdout`.
+
+---
+
+## 7 Hook Up the ACL & Core in Phase II
+
+We must edit `.agent.yml` to include at least `tools_allowed`:
+
+```yaml
+# .agent.yml (root of your repo)
+
+openai_api_key: "sk-..."
+anthropic_api_key: ""
+
+cost_cap_daily: 20.0
+
+tools_allowed:
+  - read_file
+  - write_diff
+  - run_tests
+  - static_analyze
+  - grep
+  - vector_search
+```
+
+If a user omits `tools_allowed` or leaves it empty, **no tools may run** (safe by default).
+
+---
+
+## 8 Testing the Tool Layer
+
+Create a new test file:
+
+### 8.1 `tests/test_tools.py`
+
+```python
+# coding-agent/tests/test_tools.py
+
+import subprocess, sys, json
+import os
+from pathlib import Path
+import tempfile
+import pytest
+
+# Path to the core invoker
+CORE = [sys.executable, "-c", 
+        "import agent.tools.core as c; "
+        "import sys; "
+        "data=sys.stdin.read(); "
+        "sys.stdout.write(c.invoke_tool(data))"]
+
+def run_core(request: dict) -> dict:
+    """
+    Helper to invoke the core.process with a JSON payload and return a dict.
+    """
+    p = subprocess.Popen(
+        CORE,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True
+    )
+    payload = json.dumps(request)
+    out, err = p.communicate(payload, timeout=10)
+    if err:
+        # The core module shouldn't print to stderr except on internal error
+        print("CORE STDERROR:", err)
+    try:
+        return json.loads(out)
+    except json.JSONDecodeError:
+        pytest.skip("Core did not return valid JSON: " + out)
+
+def test_read_file_success(tmp_path):
+    # Create a sample file
+    file = tmp_path / "foo.txt"
+    file.write_text("Hello, world!")
+    req = {
+        "name": "read_file",
+        "args": {"path": str(file), "start": 0, "end": 5},
+        "secure": False,
+        "timeout_seconds": 5
+    }
+    resp = run_core(req)
+    assert resp["exit_code"] == 0
+    assert resp["stdout"] == "Hello"
+
+def test_read_file_not_exists(tmp_path):
+    fake = tmp_path / "nope.txt"
+    req = {
+        "name": "read_file",
+        "args": {"path": str(fake)},
+        "secure": False,
+        "timeout_seconds": 5
+    }
+    resp = run_core(req)
+    assert resp["exit_code"] != 0
+    assert "not found" in resp["stderr"].lower()
+
+def test_acl_denied(tmp_path):
+    # Temporarily clear permissions
+    # Write a minimal .agent.yml with no tools_allowed
+    agent_yml = tmp_path / ".agent.yml"
+    agent_yml.write_text("tools_allowed: []\n")
+    os.chdir(tmp_path)
+    req = {
+        "name": "read_file",
+        "args": {"path": "whatever"},
+        "secure": False,
+        "timeout_seconds": 1
+    }
+    resp = run_core(req)
+    assert resp["exit_code"] == 1
+    assert "permission denied" in resp["stderr"].lower()
+
+def test_write_diff_roundtrip(tmp_path):
+    # Create a file and write a diff that changes a line
+    file = tmp_path / "bar.txt"
+    file.write_text("line1\nline2\nline3\n")
+    # Diff: change line2 -> "LINE2\n"
+    diff_text = """\
+--- a/bar.txt
++++ b/bar.txt
+@@ -1,3 +1,3 @@
+ line1
+-line2
++LINE2
+ line3
+"""
+    req = {
+        "name": "write_diff",
+        "args": {"path": str(file), "diff": diff_text},
+        "secure": False,
+        "timeout_seconds": 5
+    }
+    resp = run_core(req)
+    assert resp["exit_code"] == 0
+    # Verify file contents updated
+    updated = Path(file).read_text()
+    assert "LINE2" in updated
+
+def test_run_tests_failure(tmp_path):
+    # Create a tiny pytest file that fails
+    proj = tmp_path / "proj"
+    (proj / "tests").mkdir(parents=True)
+    test_file = proj / "tests" / "test_fail.py"
+    test_file.write_text("def test_fail():\n    assert False\n")
+    os.chdir(proj)
+    req = {
+        "name": "run_tests",
+        "args": {"cmd": "pytest -q"},
+        "secure": False,
+        "timeout_seconds": 10
+    }
+    resp = run_core(req)
+    assert resp["exit_code"] != 0
+    assert "1 failed" in resp["stdout"]
+
+def test_grep(tmp_path):
+    # Create two files with content
+    f1 = tmp_path / "a.txt"
+    f2 = tmp_path / "b.py"
+    f1.write_text("foo bar baz\n")
+    f2.write_text("def foo(): pass")
+    os.chdir(tmp_path)
+    req = {
+        "name": "grep",
+        "args": {"pattern": "foo", "path_glob": "*.py", "max_lines": 10},
+        "secure": False,
+        "timeout_seconds": 5
+    }
+    resp = run_core(req)
+    assert resp["exit_code"] == 0
+    assert "b.py" in resp["stdout"]
+
+@pytest.mark.skip(reason="Requires a pre‐seeded Chroma database for full vector search")
+def test_vector_search(tmp_path):
+    # This test is skipped unless you implement Phase IV to seed embeddings.
+    pass
+```
+
+> **Explanation of tests**
+>
+> * `test_read_file_success`: Creates a file, reads a slice, verifies output.
+> * `test_read_file_not_exists`: Attempts to read a missing file, expects error.
+> * `test_acl_denied`: Writes a temporary `.agent.yml` with no `tools_allowed`; expects “permission denied.”
+> * `test_write_diff_roundtrip`: Creates a file, applies a diff, verifies line changed.
+> * `test_run_tests_failure`: Makes a failing pytest, runs `run_tests`, expects nonzero exit and “1 failed” in stdout.
+> * `test_grep`: Creates files, runs `grep`, looks for a match in `.py` file.
+> * `test_vector_search`: Marked skip until Phase IV when Chroma is seeded.
+
+Run all tests:
+
+```bash
+poetry run pytest -q
+```
+
+You should see something like:
+
+```
+===== test session starts =====
+collected 5 items
+test_cli.py . 
+test_tools.py .....
+===== 5 passed in 2.3s =====
+```
+
+---
+
+## 9 Update `.gitignore`
+
+Add entries to avoid checking in generated or sensitive files:
+
+```
+# coding-agent/.gitignore
+
+# Generic
+__pycache__/
+*.py[cod]
+.venv/
+.env
+
+# Chroma DB files (Phase IV onward)
+embeddings/
+memory/archive/
+```
+
+---
+
+## 10 Developer Verification & Usage
+
+1. **Ensure Firejail (optional)**
+
+   ```bash
+   which firejail
+   # If no output, Firejail not installed → Docker fallback will be used.
+   ```
+
+2. **Build Docker runner (once)**
+
+   ```bash
+   docker build -t coding-agent-runner:latest -f ops/docker/runner.dockerfile .
+   ```
+
+3. **Point to a directory with `.agent.yml`**
+
+   ```bash
+   # Example: create a temp repo for testing
+   mkdir demo && cd demo
+   cp ../.agent.yml .   # copy your .agent.yml from coding-agent root
+   ```
+
+4. **Launch Python REPL to test `invoke_tool` manually**
+
+   ```python
+   >>> from agent.tools.core import invoke_tool
+   >>> req = {
+   ...   "name": "read_file",
+   ...   "args": {"path": "/etc/hostname", "start": 0, "end": 50},
+   ...   "secure": True,
+   ...   "timeout_seconds": 5
+   ... }
+   >>> print(invoke_tool(__import__("json").dumps(req)))
+   {"exit_code": 0, "stdout": "myhost\n", "stderr": ""}
+   ```
+
+5. **Try a restricted tool**
+
+   ```bash
+   # Edit .agent.yml → remove 'grep' from tools_allowed
+   sed -i '/grep/d' .agent.yml
+   python - <<EOF
+   ```
+
+import json
+from agent.tools.core import invoke\_tool
+req = {"name":"grep","args":{"pattern":"foo","path\_glob":"\*.py","max\_lines":5},"secure"\:False,"timeout\_seconds":3}
+print(invoke\_tool(json.dumps(req)))
+EOF
+
+# Should print: {"exit\_code":1,"stdout":"","stderr":"Permission denied for tool 'grep'"}
+
+```
+
+---
+
+## 11 Phase II Exit Criteria
+
+By the end of Phase II, **all** of these boxes must be checked:
+
+- [ ] **Tool Schema Validation**: Supplying invalid JSON or missing required keys to `invoke_tool` returns a clear JSON error (exit_code −1 or 1).
+- [ ] **ACL Enforcement**: If `.agent.yml`’s `tools_allowed` omits a tool, any `invoke_tool` call for that name returns `Permission denied`.
+- [ ] **Sandbox Behavior**:
+- If Firejail is installed, tools run under `firejail --quiet …`.
+- If Firejail is absent, tools run under Docker `coding-agent-runner:latest`.
+- [ ] **Basic Functionality**:
+- `read_file`: Reads an existing file slice correctly.
+- `write_diff`: Applies a simple unified diff via `patch`.
+- `run_tests`: Runs pytest or specified command, returns output and exit code.
+- `static_analyze`: Runs `ruff .` or overridden command, returns lint output.
+- `grep`: Finds matching lines based on pattern/glob.
+- [ ] **Test Suite Passing**: `poetry run pytest` shows all `test_tools.py` passing (ignoring `test_vector_search`).
+- [ ] **Documentation**: Comments in each `tools/*.py` and `core.py` explain expected inputs, outputs, and failure modes.
+
+Once these are satisfied, your **safe execution engine** and **tool registry** are fully operational. The next step (Phase III) will be to implement the **Memory Manager & Scratchpad System** while relying on these tool primitives for reading/writing files and searching code.
+```

@@ -1,0 +1,1 @@
+from .main import app  # re-export so `python -m cli` works

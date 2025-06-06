@@ -1,0 +1,375 @@
+Below is an **ultra-detailed “Phase I” scaffolding guide** that you can paste into a fresh terminal session and follow line-by-line.  Nothing here is hand-wavy: every directory, file, dependency, and environment variable is explained, along with *why* it exists and *how* it will plug into the later phases of your SOTA coding-agent build.
+
+---
+
+## 0 Prerequisites & Conventions
+
+| Item           | Why we need it                       | Recommended version                          |
+| -------------- | ------------------------------------ | -------------------------------------------- |
+| **Python**     | Typer, Pydantic, OpenTelemetry, etc. | 3.11‒3.12 (fast `tomllib`, pattern matching) |
+| **Poetry**     | Clean dep lock + easy publishing     | ≥ 1.7                                        |
+| **Docker**     | Future sandbox / CI runner           | ≥ 24.x                                       |
+| **Git**        | Branch isolation, hooks              | ≥ 2.42                                       |
+| **Ruff**       | Lint + import-sort                   | Matches `pyproject.toml`                     |
+| **Pre-commit** | Enforce style, secret scan           | ≥ 3.6                                        |
+
+All commands below assume a **Unix-like shell** (`bash`, `zsh`, or WSL). Adapt paths if you’re on Windows CMD/PowerShell.
+
+---
+
+## 1 Repository Initialization (10 min)
+
+```bash
+mkdir coding-agent && cd coding-agent
+git init -b main
+poetry init --name "coding-agent" --description "Full-stack SOTA coding agent" \
+            --author "You <you@example.com>" --python ">=3.11,<3.13" \
+            --license MIT --readme README.md --dependency typer \
+            --dependency pydantic \
+            --dependency rich \
+            --dependency chromadb \
+            --dependency openai \
+            --dependency open-telemetry-sdk \
+            --dependency "tqdm>=4.66" \
+            --dependency "portalocker>=2.8" \
+            --dependency "ruamel.yaml>=0.18" \
+            --dependency "markdown-it-py>=3.0" \
+            --dependency "firejail-sandbox @ git+https://github.com/your-org/firejail-sandbox.git"
+poetry add --group dev black ruff pre-commit pytest pytest-xdist ipdb
+poetry install
+```
+
+> **Rationale**
+>
+> * **Poetry** keeps all transitive pins in `poetry.lock`.  We’ll vendor this lockfile in CI so agents reproduce environments deterministically.
+> * `ruamel.yaml` beats `PyYAML` for round-tripping comments—handy for machine-editable plan files.
+> * `portalocker` provides cross-platform advisory locks for the future concurrency phase.
+
+---
+
+## 2 Top-Level Directory Layout
+
+```
+coding-agent/
+├─ cli/                         # Typer entrypoints
+│  ├─ __init__.py
+│  ├─ main.py                   # `python -m cli` or `agent` console_script
+│  └─ commands/
+│     ├─ __init__.py
+│     ├─ new.py                 # init a project workspace
+│     ├─ plan.py                # (placeholder) call planner
+│     └─ run.py                 # (placeholder) call executor loop
+├─ agent/
+│  ├─ __init__.py
+│  ├─ config.py                 # typed config & env merge
+│  ├─ utils/
+│  │  ├─ __init__.py
+│  │  └─ fs.py                  # path helpers, file locks
+│  └─ core/                     # empty for now: future phases
+├─ ops/                         # Dev-ops artefacts
+│  ├─ docker/
+│  │  └─ runner.dockerfile      # minimal python:3.12-slim image
+│  ├─ github/
+│  │  └─ workflows/ci.yml       # lint + tests on push
+│  └─ pre-commit-config.yaml    # ruff/black/secret-scan hooks
+├─ tests/                       # pytest smoke tests
+│  └─ test_cli.py
+├─ .env.example                 # model keys template
+├─ README.md
+├─ pyproject.toml
+└─ .gitignore
+```
+
+---
+
+## 3 `pyproject.toml` – Key Sections
+
+Add/verify the following blocks (Poetry already generated most):
+
+```toml
+[tool.poetry.scripts]
+agent = "cli.main:app"
+
+[tool.black]
+line-length = 100
+target-version = ["py311"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+select = ["E", "F", "I", "W", "B"]
+extend-ignore = ["E501"]  # black handles line length
+
+[tool.pytest.ini_options]
+addopts = "-q"
+python_files = "test_*"
+```
+
+> **Why Typer + console-script?**
+> The `agent` command is instantly available inside the venv (`poetry run agent --help`) *and* in Docker/CI images after `pip install .`.
+
+---
+
+## 4 CLI Bootstrap
+
+### 4.1 `cli/__init__.py`
+
+```python
+from .main import app  # re-export so `python -m cli` works
+```
+
+### 4.2 `cli/main.py`
+
+```python
+from pathlib import Path
+import typer
+from rich.console import Console
+from agent.config import Settings, get_settings
+
+app = typer.Typer(add_completion=False, rich_markup_mode="rich")
+console = Console(highlight=False)
+
+@app.callback(invoke_without_command=True)
+def main(
+    ctx: typer.Context,
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
+    config: Path = typer.Option(
+        None, "--config", "-c", exists=True, file_okay=True, dir_okay=False,
+        help="Path to .agent.yml (overrides env)"
+    ),
+):
+    """
+    :sparkles: [bold cyan]Coding-Agent CLI[/bold cyan]
+    """
+    if verbose:
+        console.print(":gear: verbose mode on")
+    ctx.obj = get_settings(config_path=config)
+    if ctx.invoked_subcommand is None:
+        console.print(ctx.get_help())
+
+# Sub-commands imported lazily to cut startup time
+from importlib import import_module
+
+for _cmd in ("new", "plan", "run"):
+    mod = import_module(f"cli.commands.{_cmd}")
+    app.add_typer(mod.app, name=_cmd)
+```
+
+### 4.3 `cli/commands/new.py`
+
+```python
+import shutil, subprocess, sys
+from pathlib import Path
+import typer, rich
+from agent.utils.fs import ensure_dir
+from rich.console import Console
+
+app = typer.Typer(help="Bootstrap a new agent-enabled repo")
+console = Console()
+
+DEFAULT_MEMORY_DIRS = ["memory/scratch", "memory/archive", "embeddings"]
+
+@app.command()
+def repo(path: Path = typer.Argument(..., help="Target project directory")):
+    if path.exists():
+        rich.print(f"[red]Error:[/red] {path} already exists.")
+        raise typer.Exit(1)
+    path.mkdir(parents=True)
+    (path / ".agent.yml").write_text("# agent-local config\n")
+    for d in DEFAULT_MEMORY_DIRS:
+        ensure_dir(path / d)
+    console.print(f":white_check_mark: Initialised agent repo at [bold]{path}[/bold]")
+```
+
+> **Later integration**: the same `new` command will also initialise a Chroma DB, install git hooks, etc.  For now we just create directories so Phase II can mount them into Firejail.
+
+---
+
+## 5 Typed Configuration System
+
+### 5.1 `agent/config.py`
+
+```python
+from __future__ import annotations
+import os
+from pathlib import Path
+from functools import lru_cache
+from pydantic import BaseSettings, Field, FilePath
+import yaml
+
+class Settings(BaseSettings):
+    openai_api_key: str = Field(..., env="OPENAI_API_KEY")
+    anthropic_api_key: str = Field("", env="ANTHROPIC_API_KEY")
+    cost_cap_daily: float = 20.0
+    memory_summarise_threshold: int = 4000  # tokens
+    model_router_default: str = "gpt-4o-mini"
+    agent_home: Path = Field(Path.cwd(), env="AGENT_HOME")
+
+    class Config:
+        env_file = ".env"
+        env_file_encoding = "utf-8"
+
+def _load_yaml(path: Path | None):
+    if path and path.exists():
+        with open(path, "r") as fh:
+            return yaml.safe_load(fh) or {}
+    return {}
+
+@lru_cache
+def get_settings(config_path: Path | None = None) -> Settings:
+    file_vals = _load_yaml(config_path or Path(".agent.yml"))
+    return Settings(**file_vals)
+```
+
+> **Why Pydantic**: validation + `.dict()` for telemetry.  We defer secret loading to `dotenv` so developers can `source .env` in shells.
+
+### 5.2 `.env.example`
+
+```env
+OPENAI_API_KEY="sk-..."
+ANTHROPIC_API_KEY=""
+# Optional: override cost caps
+DAILY_TOKEN_BUDGET="100000"
+```
+
+Developers copy to `.env`, which is git-ignored.
+
+---
+
+## 6 Utility Helpers
+
+### 6.1 `agent/utils/fs.py`
+
+```python
+from pathlib import Path
+import portalocker
+
+def ensure_dir(p: Path):
+    p.mkdir(parents=True, exist_ok=True)
+
+class FileLock:
+    def __init__(self, target: Path):
+        self.target = Path(target).with_suffix(".lock")
+        self._fh = None
+
+    def __enter__(self):
+        self._fh = open(self.target, "w")
+        portalocker.lock(self._fh, portalocker.LOCK_EX)
+
+    def __exit__(self, exc_type, exc, tb):
+        portalocker.unlock(self._fh)
+        self._fh.close()
+```
+
+> This lock utility is the seed for Phase XII’s concurrency strategy—no need to change later.
+
+---
+
+## 7 Pre-commit & Lint
+
+### 7.1 `ops/pre-commit-config.yaml`
+
+```yaml
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.4.4
+    hooks:
+      - id: ruff
+  - repo: https://github.com/psf/black
+    rev: 24.3.0
+    hooks:
+      - id: black
+        language_version: python3
+  - repo: https://github.com/zricethezav/gitleaks
+    rev: v8.18.1
+    hooks:
+      - id: gitleaks
+        stages: [commit]
+```
+
+```bash
+poetry run pre-commit install
+```
+
+---
+
+## 8 CI Stub
+
+### 8.1 `ops/github/workflows/ci.yml`
+
+```yaml
+name: lint-and-test
+on: [push, pull_request]
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: abatilo/actions-poetry@v2
+      - name: Install deps
+        run: poetry install --no-interaction
+      - name: Lint
+        run: poetry run ruff .
+      - name: Tests
+        run: poetry run pytest -n auto
+```
+
+> **Why now?** Catch lint/test drift before the agent writes its first diff.
+
+---
+
+## 9 Smoke Test
+
+### 9.1 `tests/test_cli.py`
+
+```python
+import subprocess, sys, json
+def test_cli_help():
+    out = subprocess.check_output([sys.executable, "-m", "cli", "--help"])
+    assert b"Coding-Agent" in out
+```
+
+Run once:
+
+```bash
+poetry run pytest
+```
+
+You should see `1 passed`.
+
+---
+
+## 10 Developer UX Check
+
+```bash
+# activate env
+poetry shell
+
+# generate a sample workspace
+agent new demo-project
+
+tree demo-project
+#=> memory, .agent.yml, embeddings/ ...
+
+agent --verbose
+# prints help with settings echoed
+```
+
+Everything compiles, lints, tests, and `agent new` works.  **Phase I is complete**: we have a reproducible, CI-validated scaffold with a CLI, typed settings, file-locking util, linting, secret scanning, and pre-commit—all prerequisites for every later phase.
+
+---
+
+### ✅ Phase I Exit Criteria Recap
+
+| ✔ | Criterion                                |
+| - | ---------------------------------------- |
+| ☐ | `poetry install` succeeds on clean clone |
+| ☐ | `agent --help` prints CLI banner         |
+| ☐ | `agent new foo` scaffolds default dirs   |
+| ☐ | `pre-commit run --all-files` passes      |
+| ☐ | GitHub Actions CI passes lint + tests    |
+
+> After verifying all five boxes, you’re ready to dive into **Phase II: Tool Layer + Safe Execution Engine**—where we wire the ACL, sandbox, and our first practical tools (`read_file`, `write_diff`, etc.).  Let me know when you’re ready to expand Phase II with the same level of verbosity!

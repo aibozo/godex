@@ -1,0 +1,17 @@
+name: lint-and-test
+on: [push, pull_request]
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: abatilo/actions-poetry@v2
+      - name: Install deps
+        run: poetry install --no-interaction
+      - name: Lint
+        run: poetry run ruff .
+      - name: Tests
+        run: poetry run pytest -n auto

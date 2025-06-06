@@ -1,0 +1,966 @@
+Below is a **comprehensive Phase III: Memory Manager & Scratchpad System**. We’ll cover every file, class, function, and workflow you need to:
+
+1. Create and manage human‐readable **Markdown scratch files** (“Scratchpad”).
+2. **Automatically summarize** long scratchpads when they exceed a token threshold.
+3. Persist summaries to an **archive** and replace the scratch with a shorter recap.
+4. Maintain a **vector memory** (Chroma) for code chunks and past reflections.
+5. Expose a clear API (`agent.memory.*`) so the Planner, Executor, and Reflexion layers can read/write to memory without worrying about low‐level details.
+
+Throughout, we’ll include:
+
+* **Directory layout** changes.
+* **Code listings** for every new module, annotated with “why” and “how.”
+* **Prompt templates** for summarization.
+* **Token‐count estimation** logic (using a simple approximation).
+* **Hooks** in `write_diff` and other tools to re‐embed code into the vector index.
+* **Tests** (smoke + edge cases).
+
+Let’s dive in.
+
+---
+
+## 0 Phase III Overview & Goals
+
+> **Goal**: Provide the agent with a three‐tiered memory system:
+>
+> 1. **Scratchpad (Markdown)**: human‐readable, append‐only notes, plans, and reflections. Lives under `memory/scratch/`.
+> 2. **Archive (Summaries)**: when a scratchpad grows beyond `memory_summarise_threshold` (e.g., 4 k tokens), automatically summarize older content, write the summary to `memory/archive/`, and truncate the scratchpad.
+> 3. **Vector DB**: embed code chunks, memory summaries, and other semantically valuable snippets into a Chroma collection (`embeddings/`), so the agent can retrieve them via `vector_search`.
+>
+> By the end of this phase, **any** part of the agent can call into `agent.memory` to:
+>
+> * Append a note to a scratchpad.
+> * Read the “current” scratchpad (full or truncated).
+> * Get a summary of all past scratch archives.
+> * Run a Chroma query against embeddings (already covered by Phase II’s `vector_search` tool).
+> * Insert or update embeddings for a newly modified file.
+
+---
+
+## 1 Directory Layout Additions
+
+From Phase II, our repository looks like:
+
+```
+coding-agent/
+├─ agent/
+│  ├─ __init__.py
+│  ├─ config.py
+│  ├─ utils/
+│  │  └─ fs.py
+│  └─ tools/
+│     ├─ __init__.py
+│     ├─ core.py
+│     ├─ permissions.py
+│     └─ schema.py
+├─ cli/
+│  └─ ...
+├─ tools/
+│  └─ ... (read_file, write_diff, etc.)
+├─ ops/
+│  └─ ...
+├─ tests/
+│  └─ test_tools.py, test_cli.py
+├─ .env.example
+├─ README.md
+├─ pyproject.toml
+└─ .gitignore
+```
+
+### 1.1 Add a top‐level `memory/` directory
+
+We create:
+
+```
+coding-agent/
+├─ memory/
+│  ├─ scratch/         # Live Markdown scratchpads
+│  ├─ archive/         # Completed summaries
+│  └─ metadata.json    # Quick index of which summaries exist (optional)
+```
+
+* **`memory/scratch/`**: where each “session” or “task” gets its own MD file. We’ll name them by date/time + task ID (e.g., `2025-06-10_T-42.md`).
+* **`memory/archive/`**: when a scratchpad is summarized, we move its older sections into an archived summary MD file (e.g., `2025-06-10_T-42_summary_1.md`).
+* **`memory/metadata.json`**: small JSON index mapping scratchpad filenames → list of archive filenames + summary timestamps. This makes it easy to reconstruct full memory if needed.
+
+### 1.2 Add a new package: `agent/memory/`
+
+```
+coding-agent/
+└─ agent/
+   └─ memory/
+      ├─ __init__.py
+      ├─ manager.py         # Main MemoryManager class
+      ├─ summarizer.py      # Summarization worker / prompt templates
+      ├─ vector_store.py    # Helpers for Chroma embedding of memory
+      └─ utils.py           # Token counting, file I/O helpers
+```
+
+* **`manager.py`**: orchestrates scratchpad writes, triggers summarizer when thresholds exceed, reads from archive, and exposes a public API (`append_scratch`, `read_scratch`, `get_full_memory`, etc.).
+* **`summarizer.py`**: encapsulates the logic to call an LLM (e.g., GPT-4 nano) to compress a large Markdown file into \~400 tokens, preserving TODOs and action items verbatim.
+* **`vector_store.py`**: uses Chroma’s Python client to insert “memory items” (code chunks, scratch summaries) into a `memory` collection separate from `codebase` (Phase IV will use `codebase` for code-only embeddings).
+* **`utils.py`**: functions to estimate token counts (approximate by splitting on whitespace ÷ 0.75), atomic file writes (avoid corruption), and path resolution.
+
+After Phase III, your full structure is:
+
+```
+coding-agent/
+├─ memory/
+│  ├─ scratch/
+│  ├─ archive/
+│  └─ metadata.json
+├─ agent/
+│  ├─ __init__.py
+│  ├─ config.py
+│  ├─ utils/
+│  │  └─ fs.py
+│  ├─ tools/
+│  │  └─ ...
+│  └─ memory/
+│     ├─ __init__.py
+│     ├─ manager.py
+│     ├─ summarizer.py
+│     ├─ vector_store.py
+│     └─ utils.py
+├─ cli/
+│  └─ ...
+├─ tools/
+│  └─ ...
+├─ ops/
+│  └─ ...
+├─ tests/
+│  ├─ test_tools.py
+│  ├─ test_cli.py
+│  └─ test_memory.py   # new for Phase III
+├─ .env.example
+├─ README.md
+├─ pyproject.toml
+└─ .gitignore
+```
+
+---
+
+## 2 Configuration & Thresholds
+
+Recall from Phase I:
+
+```python
+# agent/config.py
+
+class Settings(BaseSettings):
+    openai_api_key: str = Field(..., env="OPENAI_API_KEY")
+    anthropic_api_key: str = Field("", env="ANTHROPIC_API_KEY")
+    cost_cap_daily: float = 20.0
+    memory_summarise_threshold: int = 4000  # tokens
+    model_router_default: str = "gpt-4o-mini"
+    agent_home: Path = Field(Path.cwd(), env="AGENT_HOME")
+    ...
+```
+
+* **`memory_summarise_threshold`** (default = 4 000 tokens) controls when to trigger auto-summarization.
+* **`agent_home`** is the root of the repo (where `.agent.yml`, `memory/`, `embeddings/`, etc. live).
+
+Any references to paths below will prepend `Settings.agent_home`.
+
+---
+
+## 3 Token Counting & File I/O Helpers (`agent/memory/utils.py`)
+
+We need to estimate “how many tokens” a Markdown file contains. We’ll use a **rough heuristic**:
+
+> **`# tokens ≈ ceil(num_characters / 4)`**
+
+Because GPT tokenizes roughly one token per 4 characters in English. Alternatively, split by whitespace:
+
+> **`# tokens ≈ ceil(num_words / 0.75)`**
+
+Either is acceptable—our goal is to detect when a file **exceeds** `memory_summarise_threshold`.
+
+### 3.1 `agent/memory/utils.py`
+
+```python
+# coding-agent/agent/memory/utils.py
+
+import os
+from pathlib import Path
+from typing import Tuple
+
+def estimate_tokens(text: str) -> int:
+    """
+    Roughly estimate tokens in a text by counting characters.
+    Assumption: ~4 characters per token on average. 
+    """
+    num_chars = len(text)
+    return (num_chars + 3) // 4  # ceil
+
+def atomic_write(path: Path, content: str) -> None:
+    """
+    Write content to `path` atomically: write to a temp file, then rename.
+    Prevents corruption if interrupted.
+    """
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(content)
+    os.replace(tmp, path)
+
+def read_file(path: Path) -> str:
+    """
+    Simple read with error handling.
+    """
+    if not path.exists():
+        return ""
+    return path.read_text(encoding="utf-8")
+
+def append_file(path: Path, content: str) -> None:
+    """
+    Append `content` to file at `path`, creating directories as needed.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(content)
+```
+
+> **Why these helpers?**
+>
+> * We must estimate tokens before deciding whether to summarize.
+> * Atomic writes ensure that if the process is killed while writing a summary, we don’t leave truncated files.
+> * Simple read/append routines avoid duplication in `manager.py`.
+
+---
+
+## 4 Summarizer: Calling an LLM (`agent/memory/summarizer.py`)
+
+When a scratchpad’s token count exceeds `memory_summarise_threshold`, we:
+
+1. Read the entire scratchpad Markdown.
+2. Use a **prompt template** to ask GPT-4 nano (or any chosen “summary” model) to compress the content into ≤ 4 k tokens.
+3. Write the summary to a new file in `memory/archive/` (naming convention explained below).
+4. Truncate the original scratchpad to only keep a short header (e.g., “# Summary replaced on DATE\n”) plus a link to the archive.
+
+### 4.1 Prompt Template
+
+The prompt needs to:
+
+* Preserve any lines that start with `*TODO*:` or `- [ ]` (unchecked tasks).
+* Summarize everything else into a concise paragraph.
+* Output only Markdown text (so we can paste it into an MD file directly).
+
+We’ll embed these instructions directly in the code.
+
+### 4.2 `agent/memory/summarizer.py`
+
+```python
+# coding-agent/agent/memory/summarizer.py
+
+import datetime
+from typing import Tuple
+from pathlib import Path
+import openai
+from agent.config import get_settings
+from agent.memory.utils import read_file, atomic_write
+
+# --------------------------------------------------------------------------------
+# PROMPT TEMPLATE: instruct GPT-4 nano to summarize a Markdown scratchpad.
+# We use a "system + user" style for clarity, though a single‐message prompt also works.
+# --------------------------------------------------------------------------------
+
+_SUMMARY_PREFIX = """You are an expert agent responsible for compressing a project’s scratchpad notes into a concise summary.
+You must:
+- Keep any lines beginning with '- [ ]' (unchecked task) or '*TODO*:' exactly as is (do not rephrase).
+- Summarize the rest of the Markdown in a way that captures all key facts, decisions, and context, in no more than 400 tokens.
+- Output must be valid Markdown: use headings, bullet points, and paragraphs as needed, but preserve unchecked tasks verbatim.
+Example of preserving tasks:
+  - [ ] Refactor payment module
+  *TODO*: Update README with new instructions
+
+Begin summarizing below. Do not output any extra commentary—only the summary Markdown.
+---
+"""
+
+# --------------------------------------------------------------------------------
+# SELECT MODEL: GPT-4 nano (lowest‐cost, 8k window). Using OpenAI API.
+# Alternatives: Claude‐4‐nano if anthropic_api_key provided.
+# --------------------------------------------------------------------------------
+
+def _choose_model() -> str:
+    settings = get_settings()
+    # If Anthropic key exists and we prefer Claude, switch here. Default: GPT-4‐nano.
+    if settings.anthropic_api_key:
+        return "claude-4-nano"  # hypothetical model name
+    return "gpt-4o-mini"  # placeholder for OpenAI’s “GPT‐4 nano” alias
+
+# --------------------------------------------------------------------------------
+# Public function to summarize a scratchpad.
+# Input: path to MD file under memory/scratch/
+# Output: tuple(new_summary_text, archive_filename)
+# --------------------------------------------------------------------------------
+
+def summarize_scratchpad(scratch_path: Path) -> Tuple[str, Path]:
+    """
+    Summarize the given scratchpad Markdown file, write the summary to archive, and return:
+      (summary_markdown, archive_path)
+    The caller is responsible for truncating the original scratchpad.
+    """
+    settings = get_settings()
+    text = read_file(scratch_path)
+    if not text.strip():
+        # Nothing to summarize
+        return "", None
+
+    model = _choose_model()
+    prompt = _SUMMARY_PREFIX + text
+
+    # Call OpenAI (or Anthropic) API
+    try:
+        if settings.anthropic_api_key and model.startswith("claude"):
+            # Example stub: replace with actual Anthropic API call
+            summary = _call_anthropic(model, prompt, settings.anthropic_api_key)
+        else:
+            openai.api_key = settings.openai_api_key
+            completion = openai.ChatCompletion.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=400,  # ensure summary ≤ 400 tokens
+                temperature=0.2,
+            )
+            summary = completion.choices[0].message.content
+    except Exception as e:
+        raise RuntimeError(f"Summarization failed: {e}")
+
+    # Write summary to archive
+    timestamp = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    archive_fn = scratch_path.stem + f"_summary_{timestamp}.md"
+    archive_path = scratch_path.parent.parent / "archive" / archive_fn
+    archive_path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write(archive_path, summary)
+
+    return summary, archive_path
+
+# --------------------------------------------------------------------------------
+# Helper for Anthropic (stub implementation)
+# --------------------------------------------------------------------------------
+
+def _call_anthropic(model: str, prompt: str, api_key: str) -> str:
+    """
+    Example function showing how you might call Anthropic's API.
+    Replace with actual Claude API client usage.
+    """
+    # from anthropic import Anthrop
+
+    # client = Anthrop(api_key)
+    # response = client.completions.create(
+    #     model=model,
+    #     prompt=prompt,
+    #     max_tokens_to_sample=400,
+    #     temperature=0.2,
+    # )
+    # return response.completion
+    raise NotImplementedError("Anthropic summarization not wired.")  
+```
+
+> **Notes on `summarizer.py`:**
+>
+> * We choose the “smallest” model that still handles \~4 k tokens of input. For OpenAI, that’s “GPT-4 nano” (model name varies; e.g., “gpt-4o-mini”).
+> * We send a single‐message prompt (the entire scratchpad preceded by instructions) to keep code simple.
+> * We set `max_tokens=400` so the response cannot exceed \~400 tokens.
+> * We preserve unchecked tasks exactly as lines that start with `- [ ]` or `*TODO*:`.
+> * After obtaining `summary`, we name the archive file as `<scratch_stem>_summary_<ISO8601_UTC>.md`.
+> * The caller (in `manager.py`) must truncate the original scratchpad accordingly (see next section).
+
+---
+
+## 5 Vector Store Helpers (`agent/memory/vector_store.py`)
+
+We want to insert semantically‐useful items into Chroma so they can be retrieved later. We’ll maintain **two collections**:
+
+1. `codebase` (Phase IV will populate this with code chunks).
+2. `memory` (Phase III will populate this with memory summaries and important notes).
+
+Below are functions to:
+
+* **Connect** to Chroma (persisting under `embeddings/`).
+* **Insert** a new memory snippet with metadata (`{"source": "...", "timestamp": "...", "type": "summary"}` or `"scratch_note"`).
+* **Query** the `memory` collection (Phase IV’s `vector_search` tool already handles codebase; we add support for `memory` queries).
+
+### 5.1 `agent/memory/vector_store.py`
+
+```python
+# coding-agent/agent/memory/vector_store.py
+
+import uuid
+import datetime
+from typing import Dict, Any, List
+import chromadb
+from chromadb.config import Settings as ChromaSettings
+from agent.config import get_settings
+from agent.memory.utils import read_file
+
+# --------------------------------------------------------------------------------
+# Initialize Chroma client (singleton pattern)
+# --------------------------------------------------------------------------------
+
+_client = None
+
+def get_chroma_client() -> chromadb.Client:
+    global _client
+    if _client is None:
+        settings = get_settings()
+        persist_dir = settings.agent_home + "/embeddings"
+        _client = chromadb.Client(ChromaSettings(
+            chroma_db_impl="duckdb+parquet",
+            persist_directory=persist_dir
+        ))
+    return _client
+
+# --------------------------------------------------------------------------------
+# Ensure that the 'memory' collection exists
+# --------------------------------------------------------------------------------
+
+def get_memory_collection() -> chromadb.api.models.Collection.Collection:
+    client = get_chroma_client()
+    try:
+        return client.get_collection(name="memory")
+    except Exception:
+        return client.create_collection(name="memory")
+
+# --------------------------------------------------------------------------------
+# Insert a new memory snippet (summary or note) into the 'memory' collection.
+# --------------------------------------------------------------------------------
+
+def insert_memory_item(
+    text: str,
+    metadata: Dict[str, Any]
+) -> str:
+    """
+    Inserts `text` with associated `metadata` into the memory collection.
+    Returns the generated item_id (UUID).
+    """
+    col = get_memory_collection()
+    item_id = str(uuid.uuid4())
+    # Create an embedding using a local or OpenAI embedder. For simplicity, we delegate:
+    embedding = _embed_text(text)
+    col.add(
+        ids=[item_id],
+        embeddings=[embedding],
+        metadatas=[metadata],
+        documents=[text]
+    )
+    return item_id
+
+# --------------------------------------------------------------------------------
+# Example placeholder for embedding text. In real life, call OpenAI/CreateEmbedding or local model.
+# --------------------------------------------------------------------------------
+
+def _embed_text(text: str) -> List[float]:
+    """
+    Returns a vector embedding for `text`. 
+    Replace with actual embedding call (e.g., OpenAI or a local embedder).
+    """
+    settings = get_settings()
+    # Example using OpenAI: (Assuming openai-py installed)
+    # 
+    # import openai
+    # openai.api_key = settings.openai_api_key
+    # resp = openai.Embedding.create(
+    #     engine="text-embedding-3-large",
+    #     input=text
+    # )
+    # return resp["data"][0]["embedding"]
+    #
+    # For Phase III, we can stub out with a random vector or length-1 vector.
+    return [0.0] * 768  # placeholder embedding
+
+# --------------------------------------------------------------------------------
+# Query memory collection; return top‐k items with metadata.
+# --------------------------------------------------------------------------------
+
+def query_memory(query: str, k: int = 5) -> List[Dict[str, Any]]:
+    """
+    Return a list of up to k memory items matching `query`. 
+    Each item: {"id": ..., "score": ..., "document": ..., "metadata": {...}}
+    """
+    col = get_memory_collection()
+    embedding = _embed_text(query)
+    results = col.query(
+        query_embeddings=[embedding],
+        n_results=k
+    )
+    items = []
+    ids, distances, metadatas, documents = (
+        results["ids"][0],
+        results["distances"][0],
+        results["metadatas"][0],
+        results["documents"][0]
+    )
+    for idx, dist, meta, doc in zip(ids, distances, metadatas, documents):
+        items.append({
+            "id": idx,
+            "score": dist,
+            "metadata": meta,
+            "document": doc
+        })
+    return items
+```
+
+> **Key Points**
+>
+> * We lazily create a Chroma client pointing at `embeddings/`.
+> * `get_memory_collection()` ensures a separate collection named `"memory"`.
+> * In `insert_memory_item()`, we:
+>
+>   1. Generate a new `item_id` (UUID).
+>   2. Call `_embed_text(text)` (stub for now; Phase IV will replace with real embeddings).
+>   3. Add `(id, embedding, metadata, document)` to Chroma.
+> * `query_memory()` allows retrieval by semantic similarity.
+
+In Phase IV, we’ll swap out `_embed_text()` to call a real OpenAI embedding or a local SLM embedder.
+
+---
+
+## 6 Memory Manager (`agent/memory/manager.py`)
+
+This is the **heart** of Phase III. It exposes a friendly API for the rest of the agent:
+
+* **`append_scratch(task_id: str, content: str)`**: Add a note under `memory/scratch/<task_id>.md`. Then call `_maybe_summarize(task_id)` to check threshold.
+* **`read_scratch(task_id: str) → str`**: Return the current scratch content.
+* **`get_full_memory() → str`**: Concatenate all archive summaries (in chronological order) plus the current scratchpads, returning one big Markdown string.
+* **`insert_memory_snippet(text: str, metadata: dict)`**: Directly insert into vector memory.
+* **`reload_metadata()`**: Refresh the `memory/metadata.json` index.
+
+### 6.1 Implementation of `manager.py`
+
+```python
+# coding-agent/agent/memory/manager.py
+
+import json
+import datetime
+from pathlib import Path
+from typing import Optional, List, Dict
+
+from agent.config import get_settings
+from agent.memory.utils import (
+    estimate_tokens,
+    append_file,
+    read_file,
+    atomic_write
+)
+from agent.memory.summarizer import summarize_scratchpad
+from agent.memory.vector_store import insert_memory_item
+
+# --------------------------------------------------------------------------------
+# MEMORY MANAGER
+# - Manages scratchpads (live MD)
+# - Automatically summarizes to archive when threshold exceeded
+# - Maintains metadata.json for archives
+# --------------------------------------------------------------------------------
+
+class MemoryManager:
+    def __init__(self):
+        self.settings = get_settings()
+        self.home = Path(self.settings.agent_home)
+        self.scratch_dir = self.home / "memory" / "scratch"
+        self.archive_dir = self.home / "memory" / "archive"
+        self.metadata_file = self.home / "memory" / "metadata.json"
+        self._ensure_dirs()
+        self._load_metadata()
+
+    def _ensure_dirs(self):
+        self.scratch_dir.mkdir(parents=True, exist_ok=True)
+        self.archive_dir.mkdir(parents=True, exist_ok=True)
+        if not self.metadata_file.exists():
+            atomic_write(self.metadata_file, json.dumps({}))
+
+    def _load_metadata(self):
+        try:
+            raw = read_file(self.metadata_file)
+            self.metadata: Dict[str, List[str]] = json.loads(raw) if raw else {}
+        except Exception:
+            self.metadata = {}
+
+    def _save_metadata(self):
+        atomic_write(self.metadata_file, json.dumps(self.metadata, indent=2))
+
+    # ------------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------------
+
+    def append_scratch(self, task_id: str, content: str) -> None:
+        """
+        Append `content` (Markdown) to scratchpad for `task_id`.
+        Then, if token count > threshold, trigger summarization.
+        """
+        scratch_path = self.scratch_dir / f"{task_id}.md"
+        # Append timestamp and content
+        timestamp = datetime.datetime.utcnow().isoformat() + "Z"
+        header = f"\n\n---\n\n**[{timestamp}]**\n"
+        append_file(scratch_path, header + content)
+
+        # After writing, check if summarization is needed
+        full_text = read_file(scratch_path)
+        tokens = estimate_tokens(full_text)
+        if tokens >= self.settings.memory_summarise_threshold:
+            self._summarize_and_truncate(task_id)
+
+    def read_scratch(self, task_id: str) -> str:
+        """
+        Return the current contents of the scratchpad (un‐summarized portion).
+        """
+        scratch_path = self.scratch_dir / f"{task_id}.md"
+        return read_file(scratch_path)
+
+    def get_full_memory(self) -> str:
+        """
+        Return a concatenation of all archive summaries (old) + all scratchpads (current).
+        Sorted chronologically by file modification time.
+        """
+        parts: List[str] = []
+
+        # 1. Archive summaries
+        for summary_file in sorted(self.archive_dir.iterdir(), key=lambda p: p.stat().st_mtime):
+            text = read_file(summary_file)
+            parts.append(f"<!-- Archive: {summary_file.name} -->\n\n" + text)
+
+        # 2. Current scratchpads
+        for scratch_file in sorted(self.scratch_dir.iterdir(), key=lambda p: p.stat().st_mtime):
+            text = read_file(scratch_file)
+            parts.append(f"<!-- Scratch: {scratch_file.name} -->\n\n" + text)
+
+        return "\n\n".join(parts)
+
+    def insert_memory_snippet(self, text: str, metadata: Dict[str, str]) -> str:
+        """
+        Immediately embed `text` into the vector memory with given `metadata`.
+        Returns the new item_id.
+        """
+        return insert_memory_item(text, metadata)
+
+    # ------------------------------------------------------------------------
+    # Internal helper: summarize & truncate scratchpad
+    # ------------------------------------------------------------------------
+
+    def _summarize_and_truncate(self, task_id: str) -> None:
+        """
+        Summarize current scratchpad, write to archive, update metadata.json,
+        and truncate scratchpad (keep only a small header linking to archive).
+        """
+        scratch_path = self.scratch_dir / f"{task_id}.md"
+        summary_text, archive_path = summarize_scratchpad(scratch_path)
+        if not archive_path:
+            # Nothing to do
+            return
+
+        # Update metadata.json
+        key = task_id
+        rel_archive = str(archive_path.relative_to(self.home / "memory"))
+        self.metadata.setdefault(key, []).append(rel_archive)
+        self._save_metadata()
+
+        # Truncate scratchpad: include a header + link to summaries
+        link_line = f"\n\n*[Summary archived at `{rel_archive}`]*\n\n"
+        truncated_header = f"# Scratchpad for {task_id}\n\n{link_line}"
+        atomic_write(scratch_path, truncated_header)
+
+        # Also insert summary into vector memory
+        metadata = {
+            "task_id": task_id,
+            "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+            "type": "summary",
+            "archive_path": rel_archive
+        }
+        self.insert_memory_snippet(summary_text, metadata)
+```
+
+> **Detailed Explanation**
+>
+> 1. **Constructor (`__init__`)**
+>
+>    * Reads `agent_home` from settings.
+>    * Points at `memory/scratch/`, `memory/archive/`, and `memory/metadata.json`.
+>    * Calls `_ensure_dirs()` (create dirs and initial metadata).
+>    * Calls `_load_metadata()` (load existing archive index).
+> 2. **`append_scratch(task_id, content)`**
+>
+>    * Builds path: `memory/scratch/<task_id>.md`.
+>    * Prepends a Markdown timestamp header (`---` + UTC ISO time).
+>    * Appends `content`.
+>    * Reads full scratchpad; estimates tokens via `estimate_tokens()`.
+>    * If tokens ≥ `memory_summarise_threshold`, calls `_summarize_and_truncate(task_id)`.
+> 3. **`read_scratch(task_id)`**
+>
+>    * Simply reads the current scratch file (could be empty).
+> 4. **`get_full_memory()`**
+>
+>    * Lists archive files in chronological order, prepends a comment (`<!-- Archive: ... -->`) and includes their Markdown.
+>    * Lists scratch files in chronological order, prepends a comment, and includes their contents.
+>    * Joins everything into one large Markdown string for “context injection” into the Planner.
+> 5. **`insert_memory_snippet(text, metadata)`**
+>
+>    * Delegates to `insert_memory_item()` from `vector_store.py`.
+>    * This is how we add “summary” documents or ad hoc notes into the vector DB.
+> 6. **`_summarize_and_truncate(task_id)`**
+>
+>    * Calls `summarize_scratchpad()` → `(summary_text, archive_path)`.
+>
+>      * If `archive_path is None`, nothing changed.
+>    * Updates `metadata.json` with relative path of new archive.
+>    * Truncates `memory/scratch/<task_id>.md` to a minimal header + link to archive.
+>    * Inserts the summary text into vector memory (metadata includes `task_id`, `timestamp`, `type="summary"`, and `archive_path`).
+
+With this class, anywhere in the agent, you can:
+
+```python
+from agent.memory.manager import MemoryManager
+
+mem = MemoryManager()
+mem.append_scratch("T-42", "Investigating bug in payment module.")
+# If this is the first note, no summarization; if the file was large, it auto‐summarizes.
+
+current = mem.read_scratch("T-42")
+full = mem.get_full_memory()  # combine all archives + scratchpads
+mem.insert_memory_snippet("Fixed edge‐case in validate_user()", {"task_id": "T-42", "type": "code_note"})
+```
+
+---
+
+## 7 Hooking Memory Manager into Agent Flow
+
+In Phase VI (Executor), whenever the agent “thinks” or “reflects,” we’ll call `append_scratch(task_id, thought_text)` to record internal reasoning. When creating plans (Phase V), we’ll call `append_scratch(task_id, plan_markdown)`. But right now (Phase III), we test memory in isolation.
+
+To integrate, ensure that:
+
+* **`agent/planner.py`** uses `mem = MemoryManager()` and calls `mem.append_scratch` whenever it writes a plan.
+* **`agent/executor.py`** calls `mem.append_scratch` for each “Thought:” step and each reflection.
+* **`agent/reflexion.py`** calls `mem.insert_memory_snippet` to store self‐critiques as vector memory.
+
+We’ll wire these in later phases; for now, focus on making `MemoryManager` fully operational and tested.
+
+---
+
+## 8 Testing Memory Manager (`tests/test_memory.py`)
+
+Create a new test suite to verify:
+
+1. Appending to a scratchpad correctly writes Markdown.
+2. When a scratchpad exceeds threshold, summarization is triggered (we’ll stub the summarizer to just output “SUMMARIZED” text).
+3. After truncation, the scratchpad only contains a header + link.
+4. `get_full_memory()` returns both archived summaries and current scratch content.
+5. `metadata.json` correctly tracks archives.
+6. Vector insertion: we stub `_embed_text()` to avoid real embeddings but verify metadata stored.
+
+### 8.1 `tests/test_memory.py`
+
+```python
+# coding-agent/tests/test_memory.py
+
+import os
+import sys
+import json
+import tempfile
+import time
+import pytest
+from pathlib import Path
+
+from agent.memory.manager import MemoryManager
+from agent.memory.utils import estimate_tokens
+
+# --------------------------------------------------------------------------------
+# Before running tests, patch summarize_scratchpad to a no-op summarizer to control behavior.
+# --------------------------------------------------------------------------------
+
+import agent.memory.summarizer as summarizer_module
+
+def _fake_summarize(path):
+    """
+    Replace the real summarizer; simply write "FAKE SUMMARY" to archive.
+    """
+    # Create a fake summary file
+    archive_dir = path.parent.parent / "archive"
+    timestamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    archive_fn = path.stem + f"_summary_{timestamp}.md"
+    archive_path = archive_dir / archive_fn
+    archive_dir.mkdir(exist_ok=True, parents=True)
+    archive_path.write_text("FAKE SUMMARY")
+    return "FAKE SUMMARY", archive_path
+
+# Monkeypatch
+summarizer_module.summarize_scratchpad = _fake_summarize
+
+# --------------------------------------------------------------------------------
+# Test suite
+# --------------------------------------------------------------------------------
+
+def test_append_and_read_scratch(tmp_path, monkeypatch):
+    # Point agent_home to this temp dir
+    os.chdir(tmp_path)
+    # Create a bare-bones .agent.yml for config
+    (tmp_path / ".agent.yml").write_text("memory_summarise_threshold: 100\n")
+    mem = MemoryManager()
+
+    # Append a small note
+    mem.append_scratch("T-1", "# Initial note\nSome details.")
+    scratch_path = tmp_path / "memory" / "scratch" / "T-1.md"
+    content = scratch_path.read_text()
+    assert "Initial note" in content
+    # read_scratch should match
+    assert "Initial note" in mem.read_scratch("T-1")
+
+def test_summarization_trigger(tmp_path, monkeypatch):
+    os.chdir(tmp_path)
+    # Set threshold to 10 tokens for quick test
+    (tmp_path / ".agent.yml").write_text("memory_summarise_threshold: 10\n")
+    mem = MemoryManager()
+
+    # Build content ~50 characters (~12 tokens). Should exceed threshold.
+    long_text = "A " * 50  # ~100 chars → ~25 tokens
+    mem.append_scratch("T-2", long_text)
+
+    scratch_path = tmp_path / "memory" / "scratch" / "T-2.md"
+    archive_dir = tmp_path / "memory" / "archive"
+    # After summarization, scratchpad should contain only header + link
+    scratch_contents = scratch_path.read_text()
+    assert "Summary archived at" in scratch_contents
+    # Archive directory should have one file with "FAKE SUMMARY"
+    archives = list(archive_dir.iterdir())
+    assert len(archives) == 1
+    assert archives[0].read_text() == "FAKE SUMMARY"
+    # metadata.json should reference the archive
+    metadata = json.loads((tmp_path / "memory" / "metadata.json").read_text())
+    assert "T-2" in metadata
+    rel = metadata["T-2"][0]
+    assert rel.startswith("archive/T-2_summary_")
+
+def test_get_full_memory(tmp_path, monkeypatch):
+    os.chdir(tmp_path)
+    (tmp_path / ".agent.yml").write_text("memory_summarise_threshold: 100\n")
+    mem = MemoryManager()
+
+    # Create two scratchpads without triggering summarization
+    mem.append_scratch("T-3", "Short note 1.")
+    mem.append_scratch("T-4", "Short note 2.")
+
+    full = mem.get_full_memory()
+    # Should contain both scratchpad markers
+    assert "Scratch: T-3.md" in full
+    assert "Short note 1." in full
+    assert "Scratch: T-4.md" in full
+    assert "Short note 2." in full
+
+def test_insert_memory_snippet(tmp_path, monkeypatch):
+    os.chdir(tmp_path)
+    (tmp_path / ".agent.yml").write_text("memory_summarise_threshold: 100\n")
+    mem = MemoryManager()
+
+    # Insert a snippet; this uses a stubbed embedder that returns [0.0]*768
+    item_id = mem.insert_memory_snippet("Important fact", {"task_id":"T-5", "type":"note"})
+    # Now query Chroma directly to verify the item exists
+    from agent.memory.vector_store import get_memory_collection
+    col = get_memory_collection()
+    # Perform a query that matches exactly "Important fact"
+    results = col.query(query_texts=["Important fact"], n_results=1)
+    assert results["ids"][0][0] == item_id
+
+```
+
+> **Explanation of Tests**
+>
+> * We monkeypatch `summarize_scratchpad` to a fake function that writes a predictable file.
+> * **`test_append_and_read_scratch`**: appends a small note (below threshold) → no summarization; `read_scratch` should return same content.
+> * **`test_summarization_trigger`**: threshold set to 10 tokens → long text triggers summarization; we verify:
+>
+>   1. Scratchpad truncated.
+>   2. Archive file created with “FAKE SUMMARY.”
+>   3. `metadata.json` updated correctly.
+> * **`test_get_full_memory`**: two small scratchpads exist; `get_full_memory()` should list them both.
+> * **`test_insert_memory_snippet`**: stub embedding returns zero‐vector; after insertion, Chroma’s collection should return our `item_id` on identical query.
+
+Run:
+
+```bash
+poetry run pytest -q
+```
+
+You should see all new tests pass (plus prior Phase I/II tests).
+
+---
+
+## 9 Developer Walkthrough of Phase III
+
+1. **Set up environment**
+
+   ```bash
+   # From coding-agent root
+   poetry install
+   poetry shell
+   ```
+
+2. **Prepare `.agent.yml`** (temporary minimal content):
+
+   ```yaml
+   # .agent.yml
+   openai_api_key: "sk-..."
+   anthropic_api_key: ""
+   memory_summarise_threshold: 100  # for testing
+   tools_allowed:
+     - read_file
+     - write_diff
+     - run_tests
+     - static_analyze
+     - grep
+     - vector_search
+   ```
+
+3. **Run tests to verify everything**
+
+   ```bash
+   pytest -q
+   ```
+
+4. **Manual sanity checks**
+
+   ```python
+   >>> from agent.memory.manager import MemoryManager
+   >>> mem = MemoryManager()
+   # Append a tiny note (below threshold)
+   >>> mem.append_scratch("T-10", "Hello world")
+   >>> print(mem.read_scratch("T-10"))
+   Hello world
+   # Append a long note to trigger summarization
+   >>> long_note = "Word " * 200  # ~1 000 chars → ~250 tokens
+   >>> mem.append_scratch("T-10", long_note)
+   >>> print((mem.home / "memory" / "archive").ls())
+   # Should show T-10_summary_<timestamp>.md
+   ```
+
+5. **Inspect `memory/metadata.json`**
+   Open and verify it contains an entry for `"T-10"` pointing to the archive file.
+
+6. **Query vector memory**
+
+   ```python
+   >>> mem.insert_memory_snippet("Test retrieval", {"task_id":"T-11","type":"note"})
+   'some-uuid-here'
+   >>> from agent.memory.vector_store import query_memory
+   >>> results = query_memory("Test retrieval", k=1)
+   >>> print(results)
+   [{'id':'some-uuid-here', 'score':0.0, 'metadata':{'task_id':'T-11','type':'note'}, 'document':'Test retrieval'}]
+   ```
+
+   (Note: because our embedder returns zero‐vector, similarity is trivial. In Phase IV, real embeddings produce meaningful distances.)
+
+---
+
+## 10 Phase III Exit Criteria
+
+Ensure all the following are satisfied:
+
+* [ ] **Scratchpad Creation**: `append_scratch(task_id, content)` writes a file under `memory/scratch/`.
+* [ ] **Summarization Trigger**: When scratchpad ≥ `memory_summarise_threshold` tokens, a fake summary appears in `memory/archive/`, the scratchpad is truncated to a header + link, and `metadata.json` is updated.
+* [ ] **Reading Memory**: `read_scratch(task_id)` returns the post-summarization truncated scratchpad.
+* [ ] **Full Memory**: `get_full_memory()` returns archived summaries and current scratchpads in chronological order.
+* [ ] **Vector Insert & Query**: `insert_memory_snippet(text, metadata)` adds an item to Chroma `memory` collection. A subsequent `query_memory(text, 1)` returns the same item.
+* [ ] **Atomicity**: If summarization fails halfway (simulate by temporarily raising an exception in `summarizer`), no partial/truncated metadata.json or archive file is left.
+* [ ] **Test Suite**: `poetry run pytest` passes all memory‐related tests.
+
+Once these are in place, Phase III is complete: you have a robust **three‐tier memory system** (scratch → archive → vector). The agent can now “think on paper” in Markdown, prune old thoughts, and retrieve past memories semantically.
+
+In **Phase IV**, we’ll build out the **Retrieval Orchestrator**, hooking into this vector memory and also indexing code for “deep codebase awareness.”

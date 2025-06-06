@@ -1,0 +1,116 @@
+Great. Here's a comprehensive outline for your SOTA coding-agent platform build, broken down into discrete, deeply explorable components. Each section corresponds to a logical layer or capability in the system and can be expanded with full technical verbosity, including implementation details, design decisions, file structures, prompts, integration notes, and test criteria.
+
+---
+
+## 🧠 SOTA Coding Agent Build: Full Outline
+
+### I. 🧱 Project Scaffold & Initial CLI Framework
+
+* Directory structure
+* Typer CLI setup
+* Environment bootstrapping
+* Base config system (env/CLI/file)
+
+### II. 🔧 Tool Layer + Safe Execution Engine
+
+* Tool schema design (JSON)
+* Secure wrappers for shell commands
+* ACL / permission model
+* Sandbox runner (Docker / Firejail integration)
+
+### III. 📚 Memory Manager & Scratchpad System
+
+* Markdown file memory (Claude-style)
+* Summarization policy (when & how)
+* Memory compaction prompt templates
+* Vector memory backend (Chroma setup)
+
+### IV. 🔍 Retrieval Layer (Hybrid Agentic-RAG)
+
+* Chunking strategy (syntax-aware, ≤400 tokens)
+* Hybrid BM25 + vector reranking
+* On-demand retrieval orchestration
+* Auto-reindex on code change
+
+### V. 📝 Task Object & Planner Module
+
+* Task schema (YAML / dataclass)
+* Planning prompts
+* Markdown rendering
+* Acceptance tests DSL
+
+### VI. 🤖 Executor: ReAct Loop
+
+* Thought → Tool → Observation loop
+* Tool call structure
+* Tool result parsing
+* Diff writing policy
+* Linting, test gates, rollback
+
+### VII. 🪞 Reflexion System
+
+* Failure detection heuristics
+* Critique prompt design
+* Retry logic & loop control
+* Memory update hooks
+
+### VIII. 🧠 Skill Library & Code Reuse
+
+* Code + meta object storage
+* Embedding + tagging
+* Retrieval during planning/execution
+
+### IX. 🔁 Model Routing + Prompt Cache
+
+* Routing by cost/token/time budget
+* LRU prompt cache design
+* Fallback logic
+
+### X. 📈 Telemetry & Cost Control
+
+* Token usage logging
+* OpenTelemetry instrumentation
+* Cost thresholds + kill switch
+* Metrics format and export
+
+### XI. 🔒 Security Guards & Static Analysis
+
+* Regex-based dangerous command detection
+* Secret scanning (Trivy)
+* Static analysis plugin support
+
+### XII. 🔄 Concurrency & Version Isolation
+
+* Locking mechanisms
+* Branching patterns
+* Conflict detection/resolution policy
+
+### XIII. ⚙️ CI/CD Automation Hooks
+
+* GitHub bot or webhook
+* Task execution via ephemeral container
+* PR generation with plan + diff summary
+
+### XIV. 🧪 Eval Harness + Dataset Generation
+
+* Logging of prompts, actions, verdicts
+* Replay system
+* Task regression dashboard
+
+### XV. 🧠 Multimodal I/O Support
+
+* Image-to-text tool
+* OCR pipeline
+* Gemini/Claude-vision routing logic
+
+### XVI. ☁️ Infra & Scaling (Optional)
+
+* Containerized executor runner
+* Job queue system
+* Helm chart for team deployment
+
+---
+
+## ✅ Now: Section I — Project Scaffold & Initial CLI Framework
+
+Let’s now go **very verbose** on Section I. Next message will walk through every file, every command, and every design choice to get your CLI + scaffold skeleton running cleanly, ready to grow. Shall we begin?

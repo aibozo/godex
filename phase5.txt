@@ -1,0 +1,1065 @@
+Below is **Phase V: Task Object & Planner Module**, fully fleshed out with every file, class, prompt template, and test you need. We will cover:
+
+1. **Task Schema**: A Pydantic/YAML‐backed definition of “Task” objects, with fields like `id`, `description`, `accept_tests`, `budget`, and `owner`.
+2. **Planner Logic**: How to turn a user’s high‐level request (e.g., “Add OAuth login”) into a list of tasks, each with acceptance tests, rendered as both YAML and a Markdown checklist.
+3. **Prompt Templates**: Exactly what we send to the LLM (e.g., GPT-4 4.1-Sonnet or Claude 4 Sonnet) so it outputs valid YAML + Markdown.
+4. **Filesystem Hooks**: Where to save the generated `PLAN_<timestamp>.md`, how to version it, and how to load existing plans.
+5. **CLI Integration**: The `agent plan` command in `cli/commands/plan.py` that invokes the Planner, writes files, and prints out verbose diagnostics.
+6. **Acceptance‐Test DSL**: A mini‐domain specific language for specifying shell or pytest commands that verify a task’s completion.
+7. **Smoke Tests**: Under `tests/test_planner.py`, verifying that given a known prompt, the Planner returns well‐formed YAML, a matching Markdown checklist, and persists files correctly.
+
+By the end of Phase V, you’ll have a **complete Planning subsystem** that can:
+
+* Take a natural‐language request (`agent plan "Add OAuth login"`)
+* Emit a **YAML** file describing tasks:
+
+  ```yaml
+  - id: T-101
+    description: "Set up OAuth 2.0 provider integration"
+    accept_tests:
+      - "pytest tests/auth_integration.py"
+    budget:
+      tokens: 2000
+      dollars: 0.05
+    owner: "agent"
+  - id: T-102
+    description: "Implement callback endpoint for OAuth"
+    accept_tests:
+      - "pytest tests/callback.py"
+    budget:
+      tokens: 1500
+      dollars: 0.03
+    owner: "agent"
+  ```
+* Produce a **Markdown plan** (e.g., `memory/PLAN_20250611_T-101.md`):
+
+  ```markdown
+  # Plan (2025-06-11T15:23:00Z)
+
+  - [ ] T-101: Set up OAuth 2.0 provider integration
+      - Acceptance: pytest tests/auth_integration.py
+
+  - [ ] T-102: Implement callback endpoint for OAuth
+      - Acceptance: pytest tests/callback.py
+  ```
+* Save the plan in `memory/scratch/` or a dedicated `plans/` folder.
+* Allow re‐running `agent plan` to **merge** with an existing plan, preserving any checked boxes or previous notes.
+
+Let’s break it down.
+
+---
+
+## 1 Directory Layout Changes
+
+After Phase IV, our tree was:
+
+```
+coding-agent/
+├─ agent/
+│  ├─ config.py
+│  ├─ tools/
+│  ├─ memory/
+│  ├─ retrieval/
+│  └─ ... 
+├─ cli/
+│  └─ ...
+├─ tools/
+│  └─ ...
+├─ memory/
+│  └─ ...
+├─ bm25_index/
+│  └─ ...
+├─ tests/
+│  ├─ test_tools.py
+│  ├─ test_memory.py
+│  ├─ test_retrieval.py
+│  └─ ... (will add test_planner.py)
+├─ .agent.yml
+├─ README.md
+└─ pyproject.toml
+```
+
+### 1.1 Add a new package: `agent/tasks/`
+
+```
+coding-agent/
+└─ agent/
+   ├─ tasks/
+   │  ├─ __init__.py
+   │  ├─ schema.py          # Pydantic Task model & Budget sub-model
+   │  └─ manager.py         # Helper to load/dump YAML plans
+   └─ planner.py            # The Planner class (drives LLM prompt + parsing)
+```
+
+> **Why separate `tasks/`?**
+>
+> * Keeps “Task schema” logically isolated from “Planner logic.”
+> * `schema.py` only defines dataclasses, YAML serialization, and simple validators.
+> * `manager.py` can handle reading/writing plan YAML files.
+
+### 1.2 Update `cli/commands/plan.py`
+
+Replace the placeholder with a fully featured command that:
+
+* Invokes `Planner.generate_plan(user_request: str)`
+* Writes `PLAN_<timestamp>.yaml` under `memory/plans/` (we’ll create this dir)
+* Writes a human‐readable `PLAN_<timestamp>.md` under `memory/scratch/` for live editing
+* Prints both locations to stdout.
+
+### 1.3 Add a new directory for plan files
+
+Create under the repo root:
+
+```
+coding-agent/
+└─ memory/
+   ├─ scratch/
+   ├─ archive/
+   ├─ plans/               # ← new folder for raw YAML plan files
+   └─ metadata.json
+```
+
+> **“plans/” vs “scratch/”**
+>
+> * `plans/`: stores YAML-serialised Task objects, canonical source of truth for programmatic task ingestion.
+> * `scratch/`: stores Markdown versions (so humans and the agent can modify, check boxes, add notes).
+
+---
+
+## 2 Task Schema Definitions (`agent/tasks/schema.py`)
+
+We define two Pydantic models:
+
+1. **`Budget`**: nested model storing `tokens`, `dollars`, and optionally `seconds`.
+2. **`Task`**: top‐level model with fields:
+
+   * `id`: string, “T-<number>”
+   * `description`: human‐readable string
+   * `accept_tests`: list of strings (shell/pytest commands)
+   * `budget`: `Budget` model
+   * `owner`: string (`“agent”` or `"human"`)
+   * **Optional**: `status`: enum (`“pending”`, `"in_progress"`, `"done"`, `"failed"`) – for future phases.
+
+We also add a `root_validator` to ensure:
+
+* `id` is unique when loading a list of tasks.
+* `accept_tests` is non-empty list (each must be a valid string).
+
+### 2.1 `agent/tasks/schema.py`
+
+```python
+# coding-agent/agent/tasks/schema.py
+
+from __future__ import annotations
+from typing import List, Literal, Optional
+from pydantic import BaseModel, Field, root_validator, validator
+import re
+
+
+class Budget(BaseModel):
+    tokens: Optional[int] = Field(
+        None, description="Maximum number of tokens this task may consume"
+    )
+    dollars: Optional[float] = Field(
+        None, description="Maximum dollars allowed for API calls for this task"
+    )
+    seconds: Optional[int] = Field(
+        None, description="Approximate wall‐clock time estimate in seconds"
+    )
+
+    @root_validator
+    def at_least_one_specified(cls, values):
+        if values.get("tokens") is None and values.get("dollars") is None and values.get("seconds") is None:
+            raise ValueError("At least one budget field ('tokens', 'dollars', or 'seconds') must be specified")
+        return values
+
+
+class Task(BaseModel):
+    """
+    Represents a single task in a plan.
+    """
+    id: str = Field(..., description="Unique task identifier e.g. 'T-101'")
+    description: str = Field(..., description="Short human‐readable description")
+    accept_tests: List[str] = Field(
+        ..., description="List of shell commands or pytest invocations to verify task completion"
+    )
+    budget: Budget = Field(..., description="Resource budget for this task")
+    owner: Literal["agent", "human"] = Field("agent", description="Who should execute this task")
+    status: Optional[Literal["pending", "in_progress", "done", "failed"]] = Field(
+        "pending", description="Current status of task"
+    )
+
+    @validator("id")
+    def id_format(cls, v: str) -> str:
+        if not re.fullmatch(r"T-\d+", v):
+            raise ValueError("Task id must match pattern 'T-<number>' (e.g., T-101)")
+        return v
+
+    @validator("accept_tests", each_item=True)
+    def non_empty_test(cls, v: str) -> str:
+        if not v or not isinstance(v, str) or not v.strip():
+            raise ValueError("Each 'accept_tests' entry must be a non-empty string")
+        return v
+
+    class Config:
+        schema_extra = {
+            "example": {
+                "id": "T-101",
+                "description": "Implement OAuth login flow",
+                "accept_tests": ["pytest tests/auth_integration.py"],
+                "budget": {"tokens": 2000, "dollars": 0.05},
+                "owner": "agent",
+                "status": "pending"
+            }
+        }
+
+
+class Plan(BaseModel):
+    """
+    Wraps a list of Task objects.
+    """
+    tasks: List[Task]
+
+    @root_validator
+    def unique_ids(cls, values):
+        tasks = values.get("tasks", [])
+        ids = [t.id for t in tasks]
+        if len(ids) != len(set(ids)):
+            raise ValueError("All task ids must be unique within a plan")
+        return values
+```
+
+> **Notes**
+>
+> * We require at least one budget field (`tokens`, `dollars`, or `seconds`).
+> * `accept_tests` must be a list of valid, non‐empty strings.
+> * `owner` defaults to `"agent"` (the agent creates and executes these tasks). If a human wants to “reserve” a task for manual work, they can specify `"owner": "human"`.
+> * `Plan` is a simple wrapper so we can serialize/deserialize the entire YAML file as a `Plan` model.
+
+---
+
+## 3 Plan File Manager (`agent/tasks/manager.py`)
+
+`PlanManager` will handle:
+
+* **Locating** the latest plan file in `memory/plans/` (e.g., `PLAN_<timestamp>.yaml`).
+* **Loading** that YAML into a `Plan` (Pydantic) object.
+* **Saving** a new plan:
+
+  1. Serialize `Plan` → YAML
+  2. Write to `memory/plans/PLAN_<timestamp>.yaml`
+  3. Generate a **Markdown version** and write to `memory/scratch/PLAN_<timestamp>.md`.
+
+### 3.1 `agent/tasks/manager.py`
+
+```python
+# coding-agent/agent/tasks/manager.py
+
+import os
+import yaml
+import datetime
+from pathlib import Path
+from typing import Optional
+
+from agent.config import get_settings
+from agent.tasks.schema import Plan, Task
+from agent.memory.utils import atomic_write
+
+
+class PlanManager:
+    def __init__(self):
+        self.settings = get_settings()
+        self.home = Path(self.settings.agent_home)
+        self.plans_dir = self.home / "memory" / "plans"
+        self.plans_dir.mkdir(parents=True, exist_ok=True)
+        self.scratch_dir = self.home / "memory" / "scratch"
+        self.scratch_dir.mkdir(parents=True, exist_ok=True)
+
+    def _timestamp(self) -> str:
+        return datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+
+    def _plan_yaml_path(self, timestamp: str) -> Path:
+        return self.plans_dir / f"PLAN_{timestamp}.yaml"
+
+    def _plan_md_path(self, timestamp: str) -> Path:
+        return self.scratch_dir / f"PLAN_{timestamp}.md"
+
+    def save_plan(self, plan: Plan) -> None:
+        """
+        Serialize `plan` to YAML and Markdown, then write to files with current UTC timestamp.
+        """
+        ts = self._timestamp()
+        yaml_path = self._plan_yaml_path(ts)
+        md_path = self._plan_md_path(ts)
+
+        # 1. Dump YAML
+        yaml_text = yaml.safe_dump(
+            {"tasks": [t.dict(exclude_none=True) for t in plan.tasks]},
+            sort_keys=False,
+            explicit_start=True,
+        )
+        atomic_write(yaml_path, yaml_text)
+
+        # 2. Render Markdown checklist
+        md_lines = [f"# Plan ({ts})\n"]
+        for task in plan.tasks:
+            md_lines.append(f"- [ ] {task.id}: {task.description}")
+            for cmd in task.accept_tests:
+                md_lines.append(f"    - Acceptance: `{cmd}`")
+            md_lines.append("")  # blank line between tasks
+
+        md_content = "\n".join(md_lines)
+        atomic_write(md_path, md_content)
+
+    def load_latest_plan(self) -> Optional[Plan]:
+        """
+        Find the most recent PLAN_*.yaml in `plans_dir`, load and return as Plan.
+        If none exist, return None.
+        """
+        files = sorted(self.plans_dir.glob("PLAN_*.yaml"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if not files:
+            return None
+        latest = files[0]
+        data = yaml.safe_load(latest.read_text())
+        return Plan.parse_obj(data)
+
+    def merge_and_save(self, new_plan: Plan) -> None:
+        """
+        If an existing plan exists, merge on task IDs:
+          - Keep existing tasks' `status` if IDs match.
+        Otherwise, just save `new_plan`.
+        Finally, write merged plan to disk.
+        """
+        existing = self.load_latest_plan()
+        if existing:
+            # Build map from id → Task
+            existing_map = {t.id: t for t in existing.tasks}
+            merged_tasks = []
+            for t in new_plan.tasks:
+                if t.id in existing_map:
+                    # Preserve status, owner, but update description/accept_tests/budget if changed
+                    old = existing_map[t.id]
+                    merged = Task(
+                        id=t.id,
+                        description=t.description,
+                        accept_tests=t.accept_tests,
+                        budget=t.budget,
+                        owner=t.owner,
+                        status=old.status or t.status
+                    )
+                else:
+                    merged = t
+                merged_tasks.append(merged)
+            merged_plan = Plan(tasks=merged_tasks)
+        else:
+            merged_plan = new_plan
+
+        self.save_plan(merged_plan)
+```
+
+> **Key Points**
+>
+> * **`save_plan(plan)`**:
+>
+>   1. Timestamp (e.g., `20250611T162345Z`);
+>   2. Dump the plan’s tasks to YAML (`Plan.tasks` → list of dicts).
+>   3. Render a Markdown checklist:
+>
+>      ```
+>      # Plan (2025-06-11T16:23:45Z)
+>
+>      - [ ] T-101: Description
+>          - Acceptance: `pytest tests/foo.py`
+>
+>      - [ ] T-102: ...
+>      ```
+>   4. Write YAML to `memory/plans/PLAN_<ts>.yaml`.
+>   5. Write MD to `memory/scratch/PLAN_<ts>.md`.
+> * **`load_latest_plan()`**: picks the most recently modified YAML in `memory/plans/`.
+> * **`merge_and_save(new_plan)`**: merges on `id` to preserve existing `status` fields, then calls `save_plan`. This way, if a user re‐runs `agent plan` with slight changes, tasks already “done” remain checked off.
+
+---
+
+## 4 Planner Class (`agent/planner.py`)
+
+`Planner` is responsible for:
+
+1. **Accepting** a user’s high‐level string request (e.g., “Add OAuth login”) along with optional parameters like `budget` defaults.
+2. **Loading** any existing plan (via `PlanManager.load_latest_plan()`) so it can merge updates.
+3. **Building** a **prompt** to send to the LLM. This prompt must include:
+
+   * System instructions (how to format tasks).
+   * The user’s request.
+   * Any context (e.g., project type, language, existing plan tasks).
+4. **Invoking** the LLM (via the chosen model tier) with function calling disabled; expecting a pure text response: valid YAML.
+5. **Parsing** the YAML into `Plan` (via `Plan.parse_obj`).
+6. **Merging** with existing plan (preserving `status`).
+7. **Saving** the merged plan via `PlanManager.merge_and_save()`.
+8. **Returning** the new `Plan` instance so the CLI can print a summary.
+
+### 4.1 Prompt Template Details
+
+We will craft a **two‐message** ChatCompletion (OpenAI) prompt:
+
+* **System message**
+
+  ```
+  You are a task planner AI. Given a high‐level engineering request, decompose it into discrete tasks, each with:
+    - A unique Task ID of the form T-<sequential integer> (continuing from existing tasks).
+    - A brief description (under 100 characters).
+    - A list of acceptance tests (shell or pytest commands) that verify completion.
+    - A budget specifying tokens and dollars (e.g., 2000 tokens, $0.05).
+    - An owner (“agent” or “human”).
+  Output must be valid YAML following this schema:
+  ---
+  tasks:
+    - id: T-<number>
+      description: "<text>"
+      accept_tests:
+        - "<cmd1>"
+        - "<cmd2>"
+      budget:
+        tokens: <int>
+        dollars: <float>
+      owner: agent
+  ...
+  Do NOT output any other keys. Ensure the YAML is parseable by a strict parser.
+  Existing tasks (if any) will be provided as context in YAML under 'existing_tasks:'. You should continue numbering from the maximum existing ID + 1.
+  ```
+
+* **User message**
+
+  ```yaml
+  existing_tasks:
+    <YAML representation of current plan, if any, else {}>
+
+  request: |
+    <User’s natural language request, e.g., "Add OAuth login to the application">
+  defaults:
+    tokens: 2000
+    dollars: 0.05
+    owner: agent
+  ```
+
+> **Why embed `existing_tasks` in YAML?**
+>
+> * The LLM can parse the existing plan, determine the highest `T-<number>`, and continue numbering.
+> * It also avoids regenerating tasks that already exist.
+
+### 4.2 Implementation of `agent/planner.py`
+
+````python
+# coding-agent/agent/planner.py
+
+import yaml
+import re
+import os
+import openai
+from pathlib import Path
+from typing import Optional
+
+from agent.config import get_settings
+from agent.tasks.schema import Plan, Task, Budget
+from agent.tasks.manager import PlanManager
+
+class Planner:
+    def __init__(self):
+        self.settings = get_settings()
+        self.home = Path(self.settings.agent_home)
+        self.manager = PlanManager()
+        # Choose base model for planning
+        self.model = self.settings.model_router_default or "gpt-4o-mini"
+
+    def _get_existing_tasks(self) -> Optional[Plan]:
+        return self.manager.load_latest_plan()
+
+    def _next_task_id(self, existing_plan: Optional[Plan]) -> int:
+        if not existing_plan or not existing_plan.tasks:
+            return 1
+        nums = [int(re.match(r"T-(\d+)", t.id).group(1)) for t in existing_plan.tasks]
+        return max(nums) + 1
+
+    def _build_prompt(self, request: str, existing_plan: Optional[Plan]) -> dict:
+        """
+        Returns a dict of messages for ChatCompletion: {'model':..., 'messages': [...]}
+        """
+        # Prepare existing_tasks YAML
+        if existing_plan:
+            existing_tasks_data = {"tasks": [t.dict(exclude_none=True) for t in existing_plan.tasks]}
+        else:
+            existing_tasks_data = {}
+
+        system_msg = (
+            "You are a task planner AI. Given a high‐level engineering request, decompose it into discrete tasks, each with:\n"
+            "  - A unique Task ID of the form T-<sequential integer> (continuing from existing tasks).\n"
+            "  - A brief description (under 100 characters).\n"
+            "  - A list of acceptance tests (shell or pytest commands) that verify completion.\n"
+            "  - A budget specifying tokens and dollars (e.g., 2000 tokens, $0.05).\n"
+            "  - An owner ('agent' or 'human').\n"
+            "Output must be valid YAML following this schema:\n"
+            "```yaml\n"
+            "tasks:\n"
+            "  - id: T-<number>\n"
+            "    description: \"<text>\"\n"
+            "    accept_tests:\n"
+            "      - \"<cmd1>\"\n"
+            "      - \"<cmd2>\"\n"
+            "    budget:\n"
+            "      tokens: <int>\n"
+            "      dollars: <float>\n"
+            "    owner: agent\n"
+            "```\n"
+            "Do NOT output any other keys. Ensure the YAML is parseable by a strict parser.\n"
+            "Existing tasks (if any) will be provided as context in YAML under 'existing_tasks:'. "
+            "Continue numbering from the maximum existing ID + 1."
+        )
+
+        user_msg = {
+            "existing_tasks": existing_tasks_data,
+            "request": request,
+            "defaults": {
+                "tokens": self.settings.retrieval.get("planner_defaults_tokens", 2000),
+                "dollars": self.settings.retrieval.get("planner_defaults_dollars", 0.05),
+                "owner": "agent"
+            }
+        }
+
+        messages = [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": yaml.safe_dump(user_msg, sort_keys=False)}
+        ]
+
+        return {
+            "model": self.model,
+            "messages": messages,
+            "temperature": 0.2,
+            "max_tokens": 1000
+        }
+
+    def generate_plan(self, request: str) -> Plan:
+        """
+        Create or update a plan based on `request`. Returns the Plan object.
+        """
+        existing = self._get_existing_tasks()
+        prompt = self._build_prompt(request, existing)
+
+        # Call OpenAI ChatCompletion
+        openai.api_key = self.settings.openai_api_key
+        try:
+            response = openai.ChatCompletion.create(**prompt)
+            reply = response.choices[0].message.content
+        except Exception as e:
+            raise RuntimeError(f"Planner LLM call failed: {e}")
+
+        # Parse YAML from `reply`
+        try:
+            data = yaml.safe_load(reply)
+            new_plan = Plan.parse_obj(data)
+        except Exception as e:
+            raise ValueError(f"Failed to parse plan YAML: {e}\nYAML was:\n{reply}")
+
+        # Merge with existing plan, preserving status
+        self.manager.merge_and_save(new_plan)
+        return new_plan
+````
+
+> **Explanation**
+>
+> * **Constructor**: sets `self.model` from `settings.model_router_default` (e.g., `"gpt-4o-mini"`).
+> * **`_get_existing_tasks()`**: loads the latest plan from disk (or returns `None`).
+> * **`_next_task_id(existing_plan)`**: calculates the next integer (not used directly since LLM handles numbering, but kept for reference).
+> * **`_build_prompt(request, existing_plan)`**: constructs `messages` array for ChatCompletion with:
+>
+>   1. **System message**: detailed instructions on YAML format and numbering.
+>   2. **User message**: YAML‐dumped dict containing:
+>
+>      * `existing_tasks` (as a list of dicts under `"tasks"`).
+>      * `request` (string).
+>      * `defaults` (nested dict with default budgets & owner).
+> * **`generate_plan(request)`**:
+>
+>   1. Builds prompt.
+>   2. Calls `openai.ChatCompletion.create(...)`.
+>   3. Extracts `reply = response.choices[0].message.content`.
+>   4. Parses the `reply` into a Python object via `yaml.safe_load`.
+>   5. Constructs `Plan.parse_obj(data)`.
+>   6. Merges with existing plan (preserving statuses) and saves both YAML/MD via `PlanManager`.
+>   7. Returns the new `Plan` instance for CLI to print.
+
+---
+
+## 5 CLI Integration (`cli/commands/plan.py`)
+
+We replace the Phase I placeholder with a full command:
+
+```
+coding-agent/
+└─ cli/
+   └─ commands/
+      └─ plan.py
+```
+
+### 5.1 `cli/commands/plan.py`
+
+```python
+# coding-agent/cli/commands/plan.py
+
+from pathlib import Path
+import typer
+from rich.console import Console
+from rich.markdown import Markdown
+from agent.planner import Planner
+from agent.tasks.manager import PlanManager
+
+app = typer.Typer(help="Create or update a plan of tasks for your request")
+console = Console()
+
+@app.command()
+def plan(
+    request: str = typer.Argument(..., help="High‐level description of what you want to accomplish"),
+    show_markdown: bool = typer.Option(True, "--md/--no-md", help="Display generated Markdown plan"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
+):
+    """
+    Generate a task plan for the given request, decompose into tasks with acceptance tests, budgets, and owners.
+    """
+    # 1. Instantiate Planner
+    planner = Planner()
+    if verbose:
+        console.print(f":gear: Using model [bold]{planner.model}[/bold] for planning")
+
+    # 2. Generate or update plan
+    try:
+        plan_obj = planner.generate_plan(request)
+    except Exception as e:
+        console.print(f"[red]Error during planning:[/red] {e}")
+        raise typer.Exit(1)
+
+    # 3. Inform user where files were saved
+    manager = planner.manager
+    # Latest timestamp by listing memory/plans
+    ts_files = list((Path(manager.plans_dir)).glob("PLAN_*.yaml"))
+    latest_yaml = max(ts_files, key=lambda p: p.stat().st_mtime)
+    latest_md = Path(manager.scratch_dir) / f"{latest_yaml.stem}.md"
+
+    console.print(f":white_check_mark: Plan saved to [green]{latest_yaml}[/green]")
+    console.print(f":memo: Markdown plan at [green]{latest_md}[/green]")
+
+    # 4. Optionally display Markdown
+    if show_markdown:
+        md_text = latest_md.read_text()
+        console.print(Markdown(md_text))
+```
+
+> **Notes**
+>
+> * `request` is a required positional argument.
+> * `--md/--no-md` controls whether to print the Markdown plan in the console.
+> * After calling `planner.generate_plan()`, we retrieve the most recently modified `PLAN_<ts>.yaml` (since `merge_and_save` just created it).
+> * We derive `latest_md` by taking the same stem and appending `.md` under `memory/scratch/`.
+> * We print a success message and (optionally) render the Markdown via Rich.
+
+---
+
+## 6 Acceptance‐Test DSL
+
+We defined `accept_tests: List[str]`, which can contain:
+
+* **pytest commands** (e.g., `pytest tests/foo.py::test_bar`)
+* **shell commands** (e.g., `curl http://localhost:8080/health`)
+* **Multi‐step commands** joined by `&&` or separated into multiple list items.
+
+The **criteria** for valid `accept_tests` strings:
+
+1. Must be a **single string** (no YAML lists inside).
+2. Must not contain newlines (`\n`)—if a multi‐line script is needed, the agent should break it into separate list entries.
+3. Should reference files/commands that exist or will exist; the human dev can correct later.
+
+In Phase VII, test execution will run these exact commands via our `run_tests` tool, so they need to be plain shell.
+
+---
+
+## 7 Testing the Planner (`tests/test_planner.py`)
+
+We’ll write tests that:
+
+1. **Stub** the LLM call (`openai.ChatCompletion.create`) to return a known YAML string.
+2. Ensure `generate_plan(request)` returns a `Plan` object matching that YAML.
+3. Verify **`PlanManager.save_plan()`** wrote both YAML and MD correctly.
+4. Test **merging** behavior: given an existing plan with a task marked `status: done`, if the LLM output includes the same `id` with updated description, `merge_and_save` retains the `status: done`.
+
+### 7.1 `tests/test_planner.py`
+
+```python
+# coding-agent/tests/test_planner.py
+
+import os
+import sys
+import yaml
+import time
+import pytest
+from pathlib import Path
+from unittest.mock import patch, MagicMock
+
+from agent.planner import Planner
+from agent.tasks.schema import Plan, Task, Budget
+from agent.tasks.manager import PlanManager
+
+# --------------------------------------------------------------------------------
+# Helper: stub OpenAI ChatCompletion response
+# --------------------------------------------------------------------------------
+
+class DummyChoice:
+    def __init__(self, content):
+        self.message = MagicMock(content=content)
+
+class DummyResponse:
+    def __init__(self, content):
+        self.choices = [DummyChoice(content)]
+
+# --------------------------------------------------------------------------------
+# Sample YAML reply from LLM
+# --------------------------------------------------------------------------------
+
+SAMPLE_YAML = """
+tasks:
+  - id: T-1
+    description: "Initialize project repository"
+    accept_tests:
+      - "ls"
+    budget:
+      tokens: 1000
+      dollars: 0.01
+    owner: agent
+  - id: T-2
+    description: "Set up CI pipeline"
+    accept_tests:
+      - "pytest -q"
+    budget:
+      tokens: 1500
+      dollars: 0.02
+    owner: agent
+"""
+
+# --------------------------------------------------------------------------------
+# Test cases
+# --------------------------------------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def in_temp_dir(tmp_path, monkeypatch):
+    """
+    Run tests in a temp directory with a minimal .agent.yml
+    """
+    os.chdir(tmp_path)
+    agent_yml = tmp_path / ".agent.yml"
+    agent_yml.write_text("""
+openai_api_key: "test"
+anthropic_api_key: ""
+cost_cap_daily: 20.0
+memory_summarise_threshold: 1000
+tools_allowed:
+  - read_file
+  - write_diff
+  - run_tests
+  - static_analyze
+  - grep
+  - vector_search
+retrieval:
+  bm25:
+    index_dir: "bm25_index"
+    ngram_range: [1, 1]
+    max_features: 1000
+  chunker:
+    max_tokens: 100
+    overlap_tokens: 10
+  embeddings:
+    collection_name: "codebase"
+    model: "stub"
+""")
+    # Ensure memory/plans and memory/scratch exist
+    (tmp_path / "memory" / "plans").mkdir(parents=True)
+    (tmp_path / "memory" / "scratch").mkdir(parents=True)
+    yield
+
+@patch("openai.ChatCompletion.create")
+def test_generate_plan_creates_files(mock_create):
+    # Stub LLM to return SAMPLE_YAML
+    mock_create.return_value = DummyResponse(SAMPLE_YAML)
+
+    planner = Planner()
+    plan_obj = planner.generate_plan("Initialize project and CI")
+
+    # Check that plan_obj matches SAMPLE_YAML
+    assert isinstance(plan_obj, Plan)
+    assert len(plan_obj.tasks) == 2
+    assert plan_obj.tasks[0].id == "T-1"
+    assert plan_obj.tasks[1].description == "Set up CI pipeline"
+
+    # Verify YAML file was written
+    pm = planner.manager
+    yaml_files = list((Path(pm.plans_dir)).glob("PLAN_*.yaml"))
+    assert len(yaml_files) == 1
+    yaml_contents = yaml.safe_load(yaml_files[0].read_text())
+    assert "tasks" in yaml_contents
+
+    # Verify Markdown file was written
+    md_file = Path(pm.scratch_dir) / f"{yaml_files[0].stem}.md"
+    assert md_file.exists()
+    md_text = md_file.read_text()
+    assert "- [ ] T-1: Initialize project repository" in md_text
+    assert "Acceptance: `ls`" in md_text
+
+@patch("openai.ChatCompletion.create")
+def test_merge_preserves_status(mock_create):
+    # First, create an existing plan with T-1 marked as done
+    manager = PlanManager()
+    existing_plan = Plan(tasks=[
+        Task(
+            id="T-1",
+            description="Old desc",
+            accept_tests=["ls"],
+            budget=Budget(tokens=500, dollars=0.005),
+            owner="agent",
+            status="done"
+        )
+    ])
+    manager.save_plan(existing_plan)
+    time.sleep(1)  # ensure timestamp difference
+
+    # New YAML returned by LLM for the same T-1 (with updated desc)
+    NEW_YAML = """
+tasks:
+  - id: T-1
+    description: "Updated description"
+    accept_tests:
+      - "ls"
+    budget:
+      tokens: 800
+      dollars: 0.01
+    owner: agent
+  - id: T-2
+    description: "New Task"
+    accept_tests:
+      - "echo hi"
+    budget:
+      tokens: 600
+      dollars: 0.005
+    owner: agent
+"""
+    mock_create.return_value = DummyResponse(NEW_YAML)
+
+    planner = Planner()
+    new_plan = planner.generate_plan("Redefine existing and add new task")
+
+    # T-1 should preserve status="done"
+    t1 = next(t for t in new_plan.tasks if t.id == "T-1")
+    assert t1.status == "done"
+    assert t1.description == "Updated description"  # updated field
+
+    # T-2 is new, status defaults to "pending"
+    t2 = next(t for t in new_plan.tasks if t.id == "T-2")
+    assert t2.status == "pending"
+
+    # Confirm two plan files exist (original + merged)
+    yaml_files = list((Path(planner.manager.plans_dir)).glob("PLAN_*.yaml"))
+    assert len(yaml_files) == 2
+
+def test_load_latest_plan_returns_none_when_empty():
+    pm = PlanManager()
+    # Ensure no plans exist
+    for f in (Path("memory") / "plans").glob("*"):
+        f.unlink()
+    assert pm.load_latest_plan() is None
+
+def test_invalid_yaml_from_llm_raises(monkeypatch):
+    # Stub LLM to return invalid YAML
+    with patch("openai.ChatCompletion.create") as mock_create:
+        mock_create.return_value = DummyResponse("not: valid: yaml: -")
+        planner = Planner()
+        with pytest.raises(ValueError):
+            planner.generate_plan("Test invalid YAML")
+```
+
+> **Explanation of Tests**
+>
+> * **`test_generate_plan_creates_files`**:
+>
+>   1. Monkeypatch `ChatCompletion.create` to return `SAMPLE_YAML`.
+>   2. Call `Planner.generate_plan(...)`.
+>   3. Check returned `Plan` object has 2 tasks matching the YAML.
+>   4. Verify that `memory/plans/PLAN_<ts>.yaml` was created and contains `tasks`.
+>   5. Verify that `memory/scratch/PLAN_<ts>.md` exists and its contents include checklist items and “Acceptance: `<cmd>`.”
+> * **`test_merge_preserves_status`**:
+>
+>   1. Create an initial plan with `T-1` having `status="done"`.
+>   2. Save it via `PlanManager.save_plan()`.
+>   3. Sleep briefly (to ensure the timestamp on the new plan is later).
+>   4. Monkeypatch LLM response to a YAML that modifies `T-1` and adds `T-2`.
+>   5. Call `Planner.generate_plan(...)`.
+>   6. Confirm that in the new plan, `T-1.status == "done"` (preserved), but `description` updated.
+>   7. Confirm `T-2.status == "pending"`.
+>   8. Check that two YAML files now exist (one original, one merged).
+> * **`test_load_latest_plan_returns_none_when_empty`**:
+>
+>   1. Ensure `memory/plans/` is empty.
+>   2. `load_latest_plan()` returns `None`.
+> * **`test_invalid_yaml_from_llm_raises`**:
+>
+>   1. Monkeypatch LLM to return a syntactically invalid YAML string.
+>   2. Ensure `Planner.generate_plan(...)` raises a `ValueError` with details.
+
+Run all tests:
+
+```bash
+poetry run pytest -q
+```
+
+You should see something like:
+
+```
+====== test session starts ======
+collected 7 items
+test_tools.py ....
+test_memory.py ...
+test_retrieval.py ...
+test_planner.py ....
+====== 7 passed in 3.5s ======
+```
+
+---
+
+## 8 Developer Walkthrough for Phase V
+
+1. **Ensure Environment**
+
+   ```bash
+   poetry install
+   poetry shell
+   ```
+
+2. **Prepare a minimal codebase & `.agent.yml`**
+
+   ```bash
+   mkdir demo_plan
+   cd demo_plan
+   echo "print('hello')" > main.py
+   cat > .agent.yml <<'EOF'
+   ```
+
+openai\_api\_key: "sk-..."
+anthropic\_api\_key: ""
+cost\_cap\_daily: 20.0
+memory\_summarise\_threshold: 1000
+tools\_allowed:
+
+* read\_file
+* write\_diff
+* run\_tests
+* static\_analyze
+* grep
+* vector\_search
+  retrieval:
+  bm25:
+  index\_dir: "bm25\_index"
+  ngram\_range: \[1, 1]
+  max\_features: 1000
+  chunker:
+  max\_tokens: 100
+  overlap\_tokens: 10
+  embeddings:
+  collection\_name: "codebase"
+  model: "stub"
+  EOF
+  mkdir -p memory/plans memory/scratch
+
+````
+
+3. **Stub LLM Locally**  
+Because you don’t have a valid `openai_api_key`, patch it to return a fixed YAML for testing:  
+```python
+>>> from agent.planner import Planner
+>>> from unittest.mock import patch, MagicMock
+
+>>> SAMPLE_YAML = '''
+tasks:
+  - id: T-1
+    description: "Print greeting"
+    accept_tests:
+      - "python main.py"
+    budget:
+      tokens: 500
+      dollars: 0.01
+    owner: agent
+'''
+
+>>> with patch("openai.ChatCompletion.create", return_value=MagicMock(choices=[MagicMock(message=MagicMock(content=SAMPLE_YAML))])):
+...     p = Planner()
+...     plan_obj = p.generate_plan("Print greeting")
+...     print(plan_obj)
+````
+
+4. **Run the CLI Command**
+
+   ```bash
+   agent plan "Print greeting"
+   ```
+
+   You should see output like:
+
+   ```
+   ✅ Plan saved to memory/plans/PLAN_20250611T170000Z.yaml
+   📝 Markdown plan at memory/scratch/PLAN_20250611T170000Z.md
+
+   # Plan (2025-06-11T17:00:00Z)
+
+   - [ ] T-1: Print greeting
+       - Acceptance: `python main.py`
+   ```
+
+5. **Inspect YAML & Markdown**
+
+   ```bash
+   cat memory/plans/PLAN_*.yaml
+   cat memory/scratch/PLAN_*.md
+   ```
+
+6. **Re‐Run with Modified Prompt**
+
+   ```bash
+   agent plan "Print greeting and add goodbye"
+   ```
+
+   The LLM (stub) again returns `SAMPLE_YAML`; `merge_and_save`:
+
+   * Finds existing `T-1`, preserves status (still “pending”).
+   * Adds new tasks if there were any (your stub might need adjusting).
+   * Creates `PLAN_20250611T170100Z.yaml` + MD.
+
+---
+
+## 9 Phase V Exit Criteria
+
+Ensure **all** of the following before moving forward:
+
+* [ ] **Task Schema**: `agent/tasks/schema.py` defines `Budget`, `Task`, and `Plan` with proper validation.
+* [ ] **PlanManager**:
+
+  * `save_plan` writes both YAML and MD files with timestamp.
+  * `load_latest_plan` returns the most recent `Plan`.
+  * `merge_and_save` preserves existing task statuses.
+* [ ] **Planner**:
+
+  * `_build_prompt` creates a valid two‐message prompt containing system/user messages with YAML.
+  * `generate_plan` calls OpenAI (or stub) and parses YAML into `Plan` object.
+  * On invalid YAML from LLM, raises `ValueError`.
+* [ ] **CLI**: `agent plan` command works end-to-end, creating both `memory/plans/PLAN_<ts>.yaml` and `memory/scratch/PLAN_<ts>.md`, and prints Markdown.
+* [ ] **Acceptance-Test DSL**: `accept_tests` strings must be valid, non-empty commands.
+* [ ] **Tests Passing**:
+
+  ```bash
+  poetry run pytest -q
+  ```
+
+  runs `test_planner.py` (along with earlier phases) with zero failures.
+
+Once these boxes are checked, you have a fully operational **Task Object & Planner Module**. In **Phase VI**, we will build the **Executor (ReAct Loop)** to consume these tasks, call tools, update statuses, and commit code changes.
