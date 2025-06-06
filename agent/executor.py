@@ -122,7 +122,7 @@ class Executor:
                 diff_text = self.llm.chat_completion(
                     messages=prompt_payload["messages"],
                     temperature=0.2,
-                    max_tokens=1000
+                    # max_tokens will use model default
                 )
             except Exception as e:
                 self.mm.append_scratch(task.id, f"LLM call failed: {e}")
@@ -292,7 +292,7 @@ class Executor:
                 messages=[{"role": "system", "content": "You are a reflective coding agent."},
                           {"role": "user", "content": prompt}],
                 temperature=0.2,
-                max_tokens=200
+                # max_tokens will use model default
             )
         except Exception as e:
             critique = f"(Reflexion failed: {e})"

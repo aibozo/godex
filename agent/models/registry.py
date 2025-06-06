@@ -38,6 +38,7 @@ MODELS: Dict[str, ModelInfo] = {
         input_cost=15.0,  # $15/1M tokens
         output_cost=75.0,  # $75/1M tokens
         context_window=200000,
+        max_output_tokens=32000,  # Claude Opus 4 has 4K output limit (accurate)
         supports_tools=True,
         supports_vision=True,
         is_fast=False,
@@ -59,9 +60,10 @@ MODELS: Dict[str, ModelInfo] = {
     "claude-sonnet-4-20250514": ModelInfo(
         name="Claude Sonnet 4",
         provider="anthropic",
-        input_cost=3.0,   # $3/1M tokens (estimated)
-        output_cost=15.0,  # $15/1M tokens (estimated)
+        input_cost=3.0,   # $3/1M tokens
+        output_cost=15.0,  # $15/1M tokens
         context_window=200000,
+        max_output_tokens=64000,  # Claude Sonnet 4 max output
         supports_tools=True,
         supports_vision=True,
         is_fast=True,
@@ -75,10 +77,24 @@ MODELS: Dict[str, ModelInfo] = {
         input_cost=2.50,  # $2.50/1M tokens
         output_cost=10.0,  # $10/1M tokens
         context_window=128000,
+        max_output_tokens=16384,  # GPT-4o output limit
         supports_tools=True,
         supports_vision=True,
         is_fast=True,
         recommended_for=["general", "code_generation", "multimodal"]
+    ),
+    
+    "gpt-4.1-2025-04-14": ModelInfo(
+        name="GPT-4.1",
+        provider="openai",
+        input_cost=5.0,   # $5/1M tokens (estimated)
+        output_cost=15.0,  # $15/1M tokens (estimated)
+        context_window=200000,  # Large context window
+        max_output_tokens=32768,  # Safe limit for GPT-4.1
+        supports_tools=True,
+        supports_vision=True,
+        is_fast=True,
+        recommended_for=["rag", "context_retrieval", "high_context"]
     ),
     
     "o1": ModelInfo(
@@ -120,6 +136,18 @@ MODELS: Dict[str, ModelInfo] = {
         supports_tools=True,
         is_fast=True,
         recommended_for=["general", "fast_reasoning"]
+    ),
+    
+    "o3-2025-04-16": ModelInfo(
+        name="OpenAI o3",
+        provider="openai",
+        input_cost=10.0,   # Estimated - adjust when released
+        output_cost=30.0,  # Estimated
+        context_window=200000,
+        supports_tools=True,
+        supports_thinking=True,
+        is_fast=False,
+        recommended_for=["complex_planning", "reasoning", "high_level_tasks"]
     ),
     
     # Google Gemini Models
@@ -176,26 +204,27 @@ MODELS: Dict[str, ModelInfo] = {
     "gemini-2.5-pro-preview-06-05": ModelInfo(
         name="Gemini 2.5 Pro Preview",
         provider="google",
-        input_cost=2.50,   # Premium model pricing
-        output_cost=10.0,
-        thinking_input_cost=3.75,  # With thinking mode
-        thinking_output_cost=15.0,
-        context_window=2000000,
+        input_cost=1.25,   # $1.25/1M tokens (up to 200k)
+        output_cost=10.00,  # $10/1M tokens (up to 200k)
+        context_window=2000000,  # 2M token context
+        max_output_tokens=65536,  # 64K output tokens
         supports_tools=True,
-        supports_thinking=True,
         supports_vision=True,
+        supports_thinking=True,  # Includes thinking tokens
         is_fast=False,
-        recommended_for=["complex_tasks", "best_quality"]
+        recommended_for=["coding", "complex_reasoning", "planning", "advanced_tasks"]
     ),
     
     "gemini-2.5-flash-preview-05-20": ModelInfo(
         name="Gemini 2.5 Flash Preview", 
         provider="google",
-        input_cost=0.60,   # $0.60/1M tokens
-        output_cost=2.40,   # $2.40/1M tokens
-        context_window=1000000,
+        input_cost=0.15,   # $0.60/1M tokens
+        output_cost=3.50,   # $2.40/1M tokens
+        context_window=1048576,  # 1M input tokens
+        max_output_tokens=65536,  # 64K output tokens
         supports_tools=True,
         supports_vision=True,
+        supports_thinking=True,  # Gemini 2.5 supports thinking
         is_fast=True,
         recommended_for=["tool_calling", "executor", "general"]
     ),

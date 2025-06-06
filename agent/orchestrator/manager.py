@@ -131,7 +131,7 @@ class Manager:
         response = self.llm.chat_completion([
             {"role": "system", "content": "You are a task analysis specialist. Respond only with valid JSON."},
             {"role": "user", "content": analysis_prompt}
-        ], max_tokens=200)
+        ])  # Use model's default max_tokens
         
         # Parse JSON response
         import json
@@ -153,7 +153,7 @@ class Manager:
     
     def _handle_simple_response(self, message: str) -> str:
         """Handle simple questions that don't need delegation"""
-        conversation_context = self._build_conversation_context(max_tokens=2000)
+        conversation_context = self._build_conversation_context(max_tokens=16000)  # Allow rich context
         
         system_msg = """You are the Manager of Cokeydx, a sophisticated coding agent system. 
 
@@ -177,7 +177,7 @@ Please respond helpfully as the Manager."""
         response = self.llm.chat_completion([
             {"role": "system", "content": system_msg},
             {"role": "user", "content": user_content}
-        ], max_tokens=500)
+        ])  # Use model's default max_tokens
         
         self.conversation_history.append({
             "role": "manager", 
@@ -216,7 +216,7 @@ Explain your delegation strategy and what the user can expect. Be conversational
         response = self.llm.chat_completion([
             {"role": "system", "content": "You are the Manager explaining your delegation strategy. Be helpful and clear."},
             {"role": "user", "content": delegation_prompt}
-        ], max_tokens=400)
+        ])  # Use model's default max_tokens
         
         return response
     

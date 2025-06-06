@@ -9,6 +9,15 @@ __pycache__/
 embeddings/
 memory/archive/
 
+# BM25 index files (regenerated locally)
+bm25_index/
+
+# Usage database
+memory/usage.db
+
+# Generated workspaces
+workspace/
+
 # Editor
 .vscode/
 .idea/
@@ -29,3 +38,10 @@ htmlcov/
 dist/
 build/
 *.egg-info/
+
+# Logs
+llm_logs/
+*.log
+
+# Claude Code Graph
+.graph/

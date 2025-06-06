@@ -69,7 +69,7 @@ def summarize_scratchpad(scratch_path: Path) -> Tuple[str, Optional[Path]]:
             completion = client.chat.completions.create(
                 model=model,
                 messages=[{"role": "user", "content": prompt}],
-                max_tokens=400,  # ensure summary ≤ 400 tokens
+                max_tokens=1000,  # Allow reasonable summary length
                 temperature=0.2,
             )
             summary = completion.choices[0].message.content

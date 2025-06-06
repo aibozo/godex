@@ -27,6 +27,17 @@ def main(
 # Sub-commands imported lazily to cut startup time
 from importlib import import_module
 
-for _cmd in ("new", "plan", "run", "usage", "chat"):
+for _cmd in ("new", "plan", "run", "usage", "chat", "chat_debug", "chat_llm", "chat_enhanced", "chat_complete", "logs", "broker"):
     mod = import_module(f"cli.commands.{_cmd}")
-    app.add_typer(mod.app, name=_cmd)
+    # Use a different name for chat_debug, chat_llm, chat_enhanced and chat_complete
+    if _cmd == "chat_debug":
+        cmd_name = "chat-debug"
+    elif _cmd == "chat_llm":
+        cmd_name = "chat-llm"
+    elif _cmd == "chat_enhanced":
+        cmd_name = "chat-enhanced"
+    elif _cmd == "chat_complete":
+        cmd_name = "chat-complete"
+    else:
+        cmd_name = _cmd
+    app.add_typer(mod.app, name=cmd_name)
