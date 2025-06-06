@@ -27,6 +27,6 @@ def main(
 # Sub-commands imported lazily to cut startup time
 from importlib import import_module
 
-for _cmd in ("new", "plan", "run"):
+for _cmd in ("new", "plan", "run", "usage", "chat"):
     mod = import_module(f"cli.commands.{_cmd}")
     app.add_typer(mod.app, name=_cmd)

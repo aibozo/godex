@@ -1,0 +1,1124 @@
+Below is **Phase VI: Executor (ReAct Loop)**, laid out in exhaustive detail. We will implement:
+
+1. **Executor Class** (`agent/executor.py`): orchestrates the ReAct loop (“Thought → Tool → Observation”) for each task, generates diffs, runs tests, commits changes, and marks tasks as done/failed.
+2. **Tool‐Calling Schema**: how the Executor uses `agent.tools.core.invoke_tool()` to interact with our safe “tool‐layer.”
+3. **Branch & Commit Management**: each task runs on its own git branch (`agent/T-<id>`), commits diffs, and optionally pushes or leaves for review.
+4. **Retries & Rollback**: on failures (e.g., tests failing), the Executor invokes Reflexion to self‐critique and retry up to N times; if still failing, it reverts the branch and marks the task as `failed`.
+5. **Diff Generation**: how to ask the LLM to produce a unified diff (via a prompt template) rather than rewriting an entire file.
+6. **Integration Hooks**: how to update task status in the YAML plan.
+7. **Configurations** (`agent/config.py` extensions) for:
+
+   * Max tool calls per task
+   * Retry limits
+   * Failure thresholds
+   * Test and linter commands
+8. **Smoke Tests** (`tests/test_executor.py`) that simulate a trivial “Hello World” repo, stub the LLM to produce a known diff, and verify that:
+
+   * The diff is applied
+   * Tests pass or fail accordingly
+   * A git branch is created and commit exists
+   * On repeated failure, the branch is reverted and task marked “failed.”
+
+Everything here builds on the previous phases, so we’ll reference `Task`, `PlanManager`, `MemoryManager`, and our tool layer (`invoke_tool`). By the end, each task in a plan can be **executed** fully automatically (subject to retries and human review), with changes committed under a new branch.
+
+---
+
+## 1 Directory Layout Additions
+
+After Phase V, we had:
+
+```
+coding-agent/
+├─ agent/
+│  ├─ config.py
+│  ├─ utils/
+│  │  └─ fs.py
+│  ├─ tools/
+│  │  └─ core.py, permissions.py, schema.py
+│  ├─ memory/
+│  │  └─ manager.py, summarizer.py, vector_store.py, utils.py
+│  ├─ retrieval/
+│  │  └─ orchestrator.py, bm25_index.py, chunker.py, embedder.py, metadata.py
+│  ├─ tasks/
+│  │  └─ schema.py, manager.py
+│  ├─ planner.py
+│  └─ executor.py     ← New file for Phase VI
+├─ cli/
+│  ├─ main.py
+│  └─ commands/
+│     ├─ new.py
+│     ├─ plan.py
+│     └─ run.py       ← Will wire to Executor logic
+├─ memory/
+│  ├─ scratch/
+│  ├─ archive/
+│  └─ plans/
+├─ tests/
+│  ├─ test_tools.py
+│  ├─ test_memory.py
+│  ├─ test_retrieval.py
+│  ├─ test_planner.py
+│  └─ test_executor.py  ← New tests for Phase VI
+├─ .agent.yml
+├─ README.md
+└─ pyproject.toml
+```
+
+> **New additions**
+>
+> * **`agent/executor.py`**: main class for running tasks.
+> * **`cli/commands/run.py`**: replaces placeholder to invoke `Executor.run_task(task_id)` or `run_all`.
+> * **`tests/test_executor.py`**: unit tests to validate the ReAct loop.
+
+---
+
+## 2 Configuration Extensions (`agent/config.py`)
+
+In Phase I, `config.py` contained basic settings. We now extend it with Executor‐specific defaults.
+
+```python
+# coding-agent/agent/config.py
+
+from __future__ import annotations
+import os
+from pathlib import Path
+from functools import lru_cache
+from pydantic import BaseSettings, Field, FilePath
+import yaml
+
+class Settings(BaseSettings):
+    openai_api_key: str = Field(..., env="OPENAI_API_KEY")
+    anthropic_api_key: str = Field("", env="ANTHROPIC_API_KEY")
+    cost_cap_daily: float = 20.0
+    memory_summarise_threshold: int = 4000
+    model_router_default: str = "gpt-4o-mini"
+    agent_home: Path = Field(Path.cwd(), env="AGENT_HOME")
+
+    # ------------------------------
+    # Executor‐specific settings
+    # ------------------------------
+    max_tool_calls_per_task: int = Field(
+        30, description="Hard limit of tool calls (Thought‐Tool‐Observation) per task"
+    )
+    max_reflexion_retries: int = Field(
+        3, description="Number of reflexion+retry loops before marking task as failed"
+    )
+    consecutive_failure_threshold: int = Field(
+        5, description="Number of consecutive failing diffs (or test failures) to trigger rollback"
+    )
+    test_command: str = Field(
+        "pytest -q", description="Default command to run project tests"
+    )
+    lint_command: str = Field(
+        "ruff .", description="Default command to run static analysis"
+    )
+
+    class Config:
+        env_file = ".env"
+        env_file_encoding = "utf-8"
+
+def _load_yaml(path: Path | None):
+    if path and path.exists():
+        with open(path, "r") as fh:
+            return yaml.safe_load(fh) or {}
+    return {}
+
+@lru_cache
+def get_settings(config_path: Path | None = None) -> Settings:
+    file_vals = _load_yaml(config_path or Path(".agent.yml"))
+    return Settings(**file_vals)
+```
+
+> **Explanation of new fields**
+>
+> * `max_tool_calls_per_task`: ensures the agent doesn’t spin forever on a single task.
+> * `max_reflexion_retries`: bound on how many times to “self‐critique and retry.”
+> * `consecutive_failure_threshold`: if the agent’s attempts produce failing tests/lint N times in a row, we revert and bail.
+> * `test_command` / `lint_command`: default tools to verify code correctness; can be overridden by task’s `accept_tests`.
+
+---
+
+## 3 Executor Class (`agent/executor.py`)
+
+### 3.1 Overview
+
+The **Executor** is responsible for taking a single `Task` (from our plan) and carrying out:
+
+1. **Setup**
+
+   * Check out a new git branch: `agent/{task.id}` (e.g., `agent/T-101`), based off `main` (or current HEAD).
+   * Mark in memory (via `MemoryManager.append_scratch`) that the Executor has started working on the task.
+
+2. **ReAct Loop**
+   Repeatedly:
+
+   * **Thought**: Ask the LLM “Given the current context (code, plan, memory), what code modifications (diffs) or tests should I run next to satisfy `<task.description>`?”
+   * **Tool**: Interpret the LLM’s JSON‐RPC response as a `tool_call` (e.g., `write_diff`, `read_file`, `run_tests`, `static_analyze`, `grep`).
+   * **Observation**: Execute the tool via `invoke_tool()`, capture output (stdout, stderr, exit\_code).
+   * Append both “Thought” and “Observation” to the scratchpad.
+   * **Check**: After any `write_diff`, run `test_command` and `lint_command` (via tools). If both pass, mark task as `done` and break. If tests fail, go to Reflexion step.
+   * Continue until reaching `max_tool_calls_per_task` or success.
+
+3. **Reflexion + Retry**
+
+   * If a `write_diff` → tests fail, run the Reflexion module to ask the LLM: “Why did the tests fail? How do I fix?”
+   * Append the self‐critique to memory, then attempt another iteration of ReAct.
+   * Count retries; if ≥ `max_reflexion_retries` or ≥ `consecutive_failure_threshold` of failing diffs, **rollback**:
+
+     * Reset to original branch (delete `agent/T-<id>` branch).
+     * Check out `main` branch.
+     * Mark task as `failed` in plan YAML.
+     * Append failure note to scratchpad.
+
+4. **Commit / Merge**
+
+   * If tests and lint pass after a diff, commit all changes on branch `agent/T-<id>` with message: `"[Agent] Complete <task.id>: <task.description>"`.
+   * Optionally push or leave local for human review.
+   * Update task status to `"done"` in plan YAML (via `PlanManager.merge_and_save`).
+
+5. **Cleanup**
+
+   * Append final note to scratch: “Task <id> completed successfully on branch agent/<id>.”
+
+### 3.2 Dependencies & Imports
+
+```python
+# coding-agent/agent/executor.py
+
+import os
+import sys
+import json
+import shutil
+import subprocess
+import time
+import traceback
+from pathlib import Path
+from typing import Tuple, Optional
+
+import yaml
+import openai
+
+from agent.config import get_settings
+from agent.tasks.manager import PlanManager
+from agent.tasks.schema import Task, Plan
+from agent.memory.manager import MemoryManager
+from agent.tools.core import invoke_tool
+```
+
+> We need `yaml` to update task status, `openai` for LLM calls, and `invoke_tool` for safe tool execution.
+
+---
+
+## 4 Diff‐Generation Prompt Templates
+
+Instead of asking the LLM to rewrite entire files, we prompt it to **output unified diffs**. This has two benefits:
+
+* Agent only applies minimal changes.
+* We can apply diffs with confidence via our `write_diff` tool.
+
+### 4.1 Prompt for Generating a Diff
+
+We send a **system message** instructing:
+
+```
+You are a coding agent. Given the current task description, the file context (code snippets), and test failures (if any), produce a unified diff that modifies existing files to satisfy the task. 
+- Output must be valid unified diff format (patch lines starting with '---' and '+++' followed by '@@ ... @@').
+- Do NOT output entire file contents; only changed lines as a proper diff.
+- If no changes are needed (task already satisfied), output an empty diff (just "").
+```
+
+### 4.2 How to Provide Context
+
+In each “Thought” step, the Executor will collect:
+
+1. **Task description** (`task.description`).
+2. **Relevant code chunks** (via Retrieval): call `HybridRetriever.fetch_context(task.description, top_n=5)` → list of chunks.
+3. **Test failure logs** (if any): after a `run_tests` tool call that fails, capture `stdout`/`stderr`.
+4. **Memory**: current scratchpad (so the LLM knows prior “Thoughts” and “Observations”).
+
+We combine all this into a **single prompt**—a multi‐message ChatCompletion:
+
+* **System Message** (as above).
+* **User Message** containing YAML with keys:
+
+  ```yaml
+  task_id: "<T-<num>>"
+  description: |
+    <task.description>
+  code_context:
+    - file_path: "<path1>"
+      start_line: <int>
+      end_line: <int>
+      text: |
+        <code chunk 1>
+    - ...
+  test_failures: |
+    <raw test stdout/stderr, or "" if none>
+  memory: |
+    <contents of MemoryManager.read_scratch(task_id)>
+  ```
+* The LLM’s response is expected to be the unified diff text.
+
+---
+
+## 5 Executor Implementation (`agent/executor.py`)
+
+Below is the complete, annotated implementation.
+
+````python
+# coding-agent/agent/executor.py
+
+import os
+import sys
+import json
+import shutil
+import subprocess
+import time
+import traceback
+from pathlib import Path
+from typing import Tuple, Optional
+
+import yaml
+import openai
+
+from agent.config import get_settings
+from agent.tasks.manager import PlanManager
+from agent.tasks.schema import Task, Plan
+from agent.memory.manager import MemoryManager
+from agent.tools.core import invoke_tool
+from agent.retrieval.orchestrator import HybridRetriever
+
+
+class Executor:
+    def __init__(self):
+        self.settings = get_settings()
+        self.home = Path(self.settings.agent_home)
+        self.pm = PlanManager()
+        self.mm = MemoryManager()
+        self.retriever = HybridRetriever()
+        openai.api_key = self.settings.openai_api_key
+
+    # ------------------------------------------------------------
+    # Public method: run a single task by ID
+    # ------------------------------------------------------------
+    def run_task(self, task_id: str) -> None:
+        """
+        Execute the task with id=task_id according to the ReAct loop.
+        """
+        # 1. Load the latest plan and find Task
+        plan = self.pm.load_latest_plan()
+        if not plan:
+            print(f"[Executor] No plan found; aborting.")
+            return
+        task = next((t for t in plan.tasks if t.id == task_id), None)
+        if not task:
+            print(f"[Executor] Task {task_id} not found in plan.")
+            return
+        if task.status == "done":
+            print(f"[Executor] Task {task_id} is already done; skipping.")
+            return
+        if task.status == "in_progress":
+            print(f"[Executor] Task {task_id} is already in progress; skipping.")
+            return
+
+        # 2. Create and checkout new branch
+        branch_name = f"agent/{task.id}"
+        self._create_and_checkout_branch(branch_name)
+
+        # 3. Mark in-progress in plan
+        self._update_task_status(task, "in_progress")
+
+        # 4. Begin ReAct loop
+        success = self._react_loop(task)
+
+        if success:
+            # 5a. Commit final changes
+            commit_msg = f"[Agent] Complete {task.id}: {task.description}"
+            self._git_commit_all(commit_msg)
+
+            # 5b. Update status to done
+            self._update_task_status(task, "done")
+            self.mm.append_scratch(task.id, f"**Task {task.id} completed successfully on branch {branch_name}.**")
+            print(f"[Executor] Task {task.id} done; branch {branch_name} contains changes.")
+        else:
+            # 6. Rollback branch
+            self._rollback_branch(branch_name)
+            self._update_task_status(task, "failed")
+            self.mm.append_scratch(task.id, f"**Task {task.id} failed after retries; rolled back.**")
+            print(f"[Executor] Task {task.id} failed and was rolled back.")
+
+        # 7. Checkout main branch
+        self._git_checkout("main")
+
+    # ------------------------------------------------------------
+    # Public method: run all pending tasks in order
+    # ------------------------------------------------------------
+    def run_all(self) -> None:
+        """
+        Execute all tasks in the latest plan whose status != done.
+        """
+        plan = self.pm.load_latest_plan()
+        if not plan:
+            print("[Executor] No plan found; nothing to run.")
+            return
+        for task in plan.tasks:
+            if task.status != "done":
+                print(f"[Executor] Running task {task.id}: {task.description}")
+                self.run_task(task.id)
+            else:
+                print(f"[Executor] Skipping {task.id}; already done.")
+
+    # ------------------------------------------------------------
+    # Core ReAct Loop
+    # ------------------------------------------------------------
+    def _react_loop(self, task: Task) -> bool:
+        """
+        Returns True if task completes successfully; False if failed after retries/rollback.
+        """
+        tool_calls = 0
+        reflexion_retries = 0
+        consecutive_failures = 0
+        test_failures: str = ""  # preserve last test stderr for context
+
+        while tool_calls < self.settings.max_tool_calls_per_task:
+            # 1. Prepare prompt for LLM
+            prompt_payload = self._build_diff_prompt(task, test_failures)
+            # Call LLM for diff
+            try:
+                response = openai.ChatCompletion.create(
+                    model=self.settings.model_router_default,
+                    messages=prompt_payload["messages"],
+                    temperature=0.2,
+                    max_tokens=1000
+                )
+                diff_text = response.choices[0].message.content.strip()
+            except Exception as e:
+                self.mm.append_scratch(task.id, f"LLM call failed: {e}")
+                return False
+
+            self.mm.append_scratch(task.id, f"**Thought:** Generated diff:\n```diff\n{diff_text}\n```")
+
+            if not diff_text:
+                # No changes needed; run tests to verify
+                test_ok, test_out, test_err = self._run_tests_and_lint()
+                if test_ok:
+                    return True
+                else:
+                    test_failures = test_out + "\n" + test_err
+                    self.mm.append_scratch(task.id, f"**Observation:** Tests failing with no diff:\n```\n{test_failures}\n```")
+                    # Reflexion
+                    if self._should_reflect(reflexion_retries, consecutive_failures):
+                        self._do_reflexion(task, test_failures)
+                        reflexion_retries += 1
+                        consecutive_failures += 1
+                        continue
+                    else:
+                        return False
+
+            # 2. Call write_diff tool
+            tool_calls += 1
+            write_req = {
+                "name": "write_diff",
+                "args": {"path": "./", "diff": diff_text},
+                "secure": True,
+                "timeout_seconds": 60
+            }
+            write_resp = json.loads(invoke_tool(json.dumps(write_req)))
+            if write_resp["exit_code"] != 0:
+                err = write_resp["stderr"]
+                self.mm.append_scratch(task.id, f"**Observation:** write_diff failed: {err}")
+                # Treat as failure → Reflexion
+                test_failures = err
+                if self._should_reflect(reflexion_retries, consecutive_failures):
+                    self._do_reflexion(task, test_failures)
+                    reflexion_retries += 1
+                    consecutive_failures += 1
+                    continue
+                else:
+                    return False
+            else:
+                self.mm.append_scratch(task.id, f"**Observation:** Diff applied successfully.")
+
+            # 3. Run tests
+            test_ok, test_out, test_err = self._run_tests_and_lint()
+            if test_ok:
+                return True
+            else:
+                test_failures = test_out + "\n" + test_err
+                self.mm.append_scratch(task.id, f"**Observation:** Tests failing:\n```\n{test_failures}\n```")
+                # Reflexion
+                if self._should_reflect(reflexion_retries, consecutive_failures):
+                    self._do_reflexion(task, test_failures)
+                    reflexion_retries += 1
+                    consecutive_failures += 1
+                    continue
+                else:
+                    return False
+
+        # Exceeded max tool calls
+        self.mm.append_scratch(task.id, f"**Executor:** Reached max tool calls without success.")
+        return False
+
+    # ------------------------------------------------------------
+    # Helper: Build diff prompt for LLM
+    # ------------------------------------------------------------
+    def _build_diff_prompt(self, task: Task, test_failures: str) -> dict:
+        """
+        Constructs the messages list for LLM to generate a diff.
+        """
+        # 1. System message
+        system_msg = (
+            "You are a coding agent. Given the current task, generate a unified diff to complete the task. "
+            "Output only valid unified diff format. If no changes are needed, output an empty response."
+        )
+
+        # 2. Gather code context via Retrieval
+        code_chunks = self.retriever.fetch_context(task.description, top_n=5)
+        # Format code_context as YAML list
+        code_context = []
+        for chunk in code_chunks:
+            code_context.append({
+                "file_path": chunk["file_path"],
+                "start_line": chunk["start_line"],
+                "end_line": chunk["end_line"],
+                "text": chunk["text"]
+            })
+        # 3. Gather memory (scratchpad)
+        memory_text = self.mm.read_scratch(task.id)
+
+        # 4. Compose user message as YAML
+        user_dict = {
+            "task_id": task.id,
+            "description": task.description,
+            "code_context": code_context,
+            "test_failures": test_failures or "",
+            "memory": memory_text or ""
+        }
+        user_msg = yaml.safe_dump(user_dict, sort_keys=False)
+
+        return {
+            "messages": [
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg}
+            ]
+        }
+
+    # ------------------------------------------------------------
+    # Helper: Run tests and lint via tools
+    # ------------------------------------------------------------
+    def _run_tests_and_lint(self) -> Tuple[bool, str, str]:
+        """
+        Returns (tests_and_lint_passed, stdout, stderr).
+        """
+        # 1. run_tests
+        run_req = {
+            "name": "run_tests",
+            "args": {"cmd": self.settings.test_command},
+            "secure": True,
+            "timeout_seconds": 120
+        }
+        run_resp = json.loads(invoke_tool(json.dumps(run_req)))
+        tests_ok = (run_resp["exit_code"] == 0)
+        out = run_resp["stdout"]
+        err = run_resp["stderr"]
+
+        # 2. static_analyze
+        lint_req = {
+            "name": "static_analyze",
+            "args": {"cmd": self.settings.lint_command},
+            "secure": True,
+            "timeout_seconds": 60
+        }
+        lint_resp = json.loads(invoke_tool(json.dumps(lint_req)))
+        lint_ok = (lint_resp["exit_code"] == 0)
+        out += "\n" + lint_resp["stdout"]
+        err += "\n" + lint_resp["stderr"]
+
+        return (tests_ok and lint_ok, out, err)
+
+    # ------------------------------------------------------------
+    # Helper: Decide if we should reflex and retry
+    # ------------------------------------------------------------
+    def _should_reflect(self, reflexion_retries: int, consecutive_failures: int) -> bool:
+        if reflexion_retries < self.settings.max_reflexion_retries and consecutive_failures < self.settings.consecutive_failure_threshold:
+            return True
+        return False
+
+    # ------------------------------------------------------------
+    # Helper: Perform a Reflexion step
+    # ------------------------------------------------------------
+    def _do_reflexion(self, task: Task, test_failures: str) -> None:
+        """
+        Ask LLM to self‐critique last failure and append to memory.
+        """
+        prompt = (
+            f"Task {task.id} failed tests/lint. Here are failure logs:\n\n```\n{test_failures}\n```\n"
+            f"Explain in 3 bullet points why the failure occurred and suggest what to change next time."
+        )
+        try:
+            response = openai.ChatCompletion.create(
+                model=self.settings.model_router_default,
+                messages=[{"role": "system", "content": "You are a reflective coding agent."},
+                          {"role": "user", "content": prompt}],
+                temperature=0.2,
+                max_tokens=200
+            )
+            critique = response.choices[0].message.content.strip()
+        except Exception as e:
+            critique = f"(Reflexion failed: {e})"
+
+        self.mm.append_scratch(task.id, f"**Reflexion:**\n{critique}")
+
+    # ------------------------------------------------------------
+    # Helper: Update task status in plan YAML
+    # ------------------------------------------------------------
+    def _update_task_status(self, task: Task, new_status: str) -> None:
+        """
+        Load latest plan, set task.status=new_status, merge & save.
+        """
+        plan = self.pm.load_latest_plan()
+        for t in plan.tasks:
+            if t.id == task.id:
+                t.status = new_status
+        self.pm.merge_and_save(plan)
+
+    # ------------------------------------------------------------
+    # Helper: Git operations
+    # ------------------------------------------------------------
+    def _git(self, cmd: str) -> Tuple[bool, str]:
+        """
+        Run a git command in the repo root; return (success, output).
+        """
+        proc = subprocess.Popen(
+            cmd, shell=True, cwd=self.home,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+        )
+        out, _ = proc.communicate()
+        return (proc.returncode == 0, out)
+
+    def _create_and_checkout_branch(self, branch: str) -> None:
+        """
+        Create a new branch from main and checkout.
+        """
+        # Ensure main is up-to-date
+        self._git("git checkout main")
+        # Create branch (force if exists)
+        self._git(f"git branch -D {branch}")
+        success, out = self._git(f"git checkout -b {branch}")
+        if not success:
+            raise RuntimeError(f"Failed to create branch {branch}: {out}")
+
+    def _git_commit_all(self, message: str) -> None:
+        """
+        Stage all changes and commit.
+        """
+        self._git("git add .")
+        success, out = self._git(f"git commit -m {json.dumps(message)}")
+        if not success:
+            raise RuntimeError(f"Git commit failed: {out}")
+
+    def _git_checkout(self, branch: str) -> None:
+        """
+        Checkout existing branch (e.g., 'main').
+        """
+        self._git(f"git checkout {branch}")
+
+    def _rollback_branch(self, branch: str) -> None:
+        """
+        Delete the branch and reset to main.
+        """
+        # Checkout main
+        self._git("git checkout main")
+        # Delete branch
+        self._git(f"git branch -D {branch}")
+        # Discard any changes (in case diffs applied but commit failed)
+        self._git("git reset --hard")
+````
+
+> **Detailed Walkthrough**
+>
+> 1. **Constructor**
+>
+>    * Loads settings, `PlanManager`, `MemoryManager`, and `HybridRetriever`.
+>    * Sets `openai.api_key`.
+> 2. **`run_task(task_id)`**
+>
+>    * Loads latest `Plan`, finds `Task` by `task_id`.
+>    * If `status=="done"` or `"in_progress"`, skip.
+>    * Creates a new branch `agent/{task.id}` (force‐deleting any existing).
+>    * Marks task as `"in_progress"` in plan YAML.
+>    * Calls `_react_loop(task)`.
+>
+>      * If it returns `True`: commit changes + mark `"done"` + append scratch note + print success.
+>      * If `False`: rollback branch + mark `"failed"` + append scratch note + print failure.
+>    * Finally, checks out `main`.
+> 3. **`run_all()`**
+>
+>    * Loads plan; iterates over tasks; calls `run_task` on each pending task.
+> 4. **`_react_loop(task)`**
+>
+>    * Tracks `tool_calls`, `reflexion_retries`, `consecutive_failures`, and `test_failures` (string).
+>    * Until `tool_calls >= max_tool_calls_per_task`:
+>
+>      1. **Build diff prompt** (`_build_diff_prompt`) including:
+>
+>         * Task ID & description
+>         * Code context (via Retrieval) – list of chunks with `file_path`, `start_line`, `end_line`, `text`
+>         * `test_failures` (last failure logs, or empty)
+>         * Agent memory scratchpad (via `MemoryManager.read_scratch`)
+>      2. **Call LLM** with this prompt → get `diff_text` (unified diff).
+>      3. Append “Thought” to memory: the raw diff.
+>      4. If `diff_text` empty:
+>
+>         * Run tests+lint via `_run_tests_and_lint()`.
+>         * If both pass → return `True`.
+>         * Else → update `test_failures`, append “Observation” to memory, enter Reflexion or return `False` if thresholds exceeded.
+>      5. Else (`diff_text` non‐empty):
+>
+>         * Increment `tool_calls`.
+>         * Call `write_diff` tool with `{"path":"./","diff": diff_text}`.
+>         * If tool fails → record failure in memory, go to Reflexion or bail.
+>         * If tool succeeds → append “Observation” to memory.
+>         * Run tests+lint again:
+>
+>           * If pass → return `True`
+>           * Else → record `test_failures`, append to memory, Reflexion or bail.
+>    * If loop ends without success (exceeded `max_tool_calls_per_task`), append note and return `False`.
+> 5. **`_do_reflexion(task, test_failures)`**
+>
+>    * Sends a simple prompt: “Explain in 3 bullet points why failure occurred…”
+>    * Appends the LLM’s critique to memory.
+> 6. **Git Helpers**
+>
+>    * `_create_and_checkout_branch(branch)`: deletes existing branch if any, then `git checkout -b ...`.
+>    * `_git_commit_all(message)`: `git add .` + `git commit -m message`.
+>    * `_rollback_branch(branch)`: `git checkout main` + `git branch -D branch` + `git reset --hard` to discard any uncommitted changes.
+> 7. **Task Status Update**
+>
+>    * `_update_task_status(...)` loads latest `Plan`, sets `task.status`, and calls `PlanManager.merge_and_save`.
+
+---
+
+## 6 CLI Hook for Execution (`cli/commands/run.py`)
+
+We replace the placeholder with a command that supports:
+
+* `agent run --task T-<id>` to run a single task
+* `agent run --all` to run all pending tasks
+
+### 6.1 `cli/commands/run.py`
+
+```python
+# coding-agent/cli/commands/run.py
+
+import typer
+from rich.console import Console
+from agent.executor import Executor
+
+app = typer.Typer(help="Execute tasks from the plan")
+console = Console()
+
+@app.command()
+def run(
+    task: str = typer.Option("", "--task", "-t", help="Task ID to run (e.g., T-101)"),
+    all_tasks: bool = typer.Option(False, "--all", "-a", help="Run all pending tasks"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
+):
+    """
+    Execute one task or all tasks.
+    """
+    executor = Executor()
+    if task:
+        if verbose:
+            console.print(f":gear: Executing task [bold]{task}[/bold]")
+        executor.run_task(task)
+    elif all_tasks:
+        if verbose:
+            console.print(":gear: Executing all pending tasks")
+        executor.run_all()
+    else:
+        console.print("[red]Error:[/red] Must specify --task or --all")
+        raise typer.Exit(1)
+```
+
+> **Usage Examples**
+>
+> * `agent run --task T-101`
+> * `agent run --all`
+> * With verbose: `agent run --task T-101 --verbose`
+
+---
+
+## 7 Testing the Executor (`tests/test_executor.py`)
+
+We need to simulate a tiny git repo, stub the LLM to produce known diffs, and verify:
+
+1. **Happy Path**: Given a task “Create file foo.txt” and a stubbed diff `+foo.txt`, Executor applies diff, tests pass (we’ll use a dummy test), commits, and marks task done.
+2. **Test Failure + Reflexion**: Given a diff that doesn’t fix tests, stub Reflexion to produce a “correcting” diff on second try, verify that after retry the tests pass.
+3. **Failure After Retries**: If reflexion stub always returns a bad diff, after exceeding retries or failure threshold, the branch is rolled back and status is “failed.”
+
+### 7.1 `tests/test_executor.py`
+
+```python
+# coding-agent/tests/test_executor.py
+
+import os
+import sys
+import time
+import json
+import shutil
+import tempfile
+import pytest
+from pathlib import Path
+from unittest.mock import patch, MagicMock
+
+from agent.executor import Executor
+from agent.tasks.schema import Task, Budget
+from agent.tasks.manager import PlanManager
+
+# --------------------------------------------------------------------------------
+# Helper: stub ChatCompletion for diff generation and reflexion
+# --------------------------------------------------------------------------------
+
+class DummyChoice:
+    def __init__(self, content):
+        self.message = MagicMock(content=content)
+
+class DummyResponse:
+    def __init__(self, content):
+        self.choices = [DummyChoice(content)]
+
+# --------------------------------------------------------------------------------
+# Create a simple repo for testing:
+# - A file 'hello.py' with a failing test
+# - A test file 'tests/test_hello.py' that tests for function 'greet'
+# --------------------------------------------------------------------------------
+
+@pytest.fixture(scope="function")
+def demo_repo(tmp_path, monkeypatch):
+    """
+    Set up:
+      hello.py (empty or stub)
+      tests/test_hello.py that expects greet() to return 'hello'
+    """
+    os.chdir(tmp_path)
+    # Initialize git
+    subprocess = __import__("subprocess")
+    subprocess.run(["git", "init", "-b", "main"], check=True)
+
+    # Create hello.py without greet() to cause initial failure
+    hello = tmp_path / "hello.py"
+    hello.write_text("")
+
+    # Create tests directory
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    test_file = tests_dir / "test_hello.py"
+    test_file.write_text(
+        "from hello import greet\n"
+        "def test_greet():\n"
+        "    assert greet() == 'hello'\n"
+    )
+
+    # Create a basic .agent.yml
+    (tmp_path / ".agent.yml").write_text("""
+openai_api_key: "test"
+anthropic_api_key: ""
+cost_cap_daily: 20.0
+memory_summarise_threshold: 1000
+max_tool_calls_per_task: 5
+max_reflexion_retries: 1
+consecutive_failure_threshold: 1
+test_command: "pytest -q"
+lint_command: "ruff ."
+tools_allowed:
+  - read_file
+  - write_diff
+  - run_tests
+  - static_analyze
+  - grep
+  - vector_search
+retrieval:
+  bm25:
+    index_dir: "bm25_index"
+    ngram_range: [1, 1]
+    max_features: 1000
+  chunker:
+    max_tokens: 100
+    overlap_tokens: 10
+  embeddings:
+    collection_name: "codebase"
+    model: "stub"
+""")
+    # Create initial plan with one task: Add greet() to hello.py
+    task = Task(
+        id="T-1",
+        description="Implement greet() in hello.py",
+        accept_tests=["pytest -q"],
+        budget=Budget(tokens=500, dollars=0.01),
+        owner="agent",
+        status="pending"
+    )
+    plan = Plan(tasks=[task])
+    pm = PlanManager()
+    pm.save_plan(plan)
+
+    # Ensure memory folders exist
+    (tmp_path / "memory" / "scratch").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "memory" / "archive").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "memory" / "plans").mkdir(parents=True, exist_ok=True)
+
+    # Monkeypatch AGENT_HOME
+    monkeypatch.setenv("AGENT_HOME", str(tmp_path))
+
+    return tmp_path
+
+# --------------------------------------------------------------------------------
+# 1. Happy Path: stub LLM returns diff that adds greet()
+# --------------------------------------------------------------------------------
+
+@patch("openai.ChatCompletion.create")
+def test_executor_happy_path(mock_create, demo_repo):
+    # Stub LLM to return a diff that adds greet()
+    diff_text = (
+        "--- a/hello.py\n"
+        "+++ b/hello.py\n"
+        "@@ -0,0 +1,3 @@\n"
+        " def greet():\n"
+        "     return 'hello'\n"
+    )
+    mock_create.return_value = DummyResponse(diff_text)
+
+    executor = Executor()
+    executor.run_task("T-1")
+
+    # After execution, hello.py should contain greet()
+    content = (demo_repo / "hello.py").read_text()
+    assert "def greet()" in content
+
+    # Tests should pass now
+    proc = subprocess.Popen(
+        "pytest -q", shell=True, cwd=demo_repo, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+    )
+    out, err = proc.communicate(timeout=10)
+    assert proc.returncode == 0
+
+    # Check that a branch 'agent/T-1' exists
+    branches = subprocess.check_output(["git", "branch"], cwd=demo_repo).decode()
+    assert "agent/T-1" in branches
+
+    # Check task status updated to done in latest plan
+    pm = PlanManager()
+    plan = pm.load_latest_plan()
+    t1 = next(t for t in plan.tasks if t.id == "T-1")
+    assert t1.status == "done"
+
+# --------------------------------------------------------------------------------
+# 2. Test Failure + Reflexion: First diff fails, reflexion produces correct diff
+# --------------------------------------------------------------------------------
+
+@patch("openai.ChatCompletion.create")
+def test_executor_reflexion_success(mock_create, demo_repo):
+    """
+    - First LLM call returns a diff that does NOT implement greet() properly.
+    - Tests still fail → Reflexion triggers.
+    - Second LLM call returns correct diff → tests pass.
+    """
+    # Sequence of responses:
+    # 1st call: bad diff (empty or incorrect)
+    bad_diff = ""  # no changes
+    # 2nd call (Reflexion): LLM provides critique (ignored by Executor)
+    # for simplicity, respond with some critique (not used directly)
+    critique = "Bullet 1: greet() missing\nBullet 2: ..."
+    # 3rd call: correct diff
+    good_diff = (
+        "--- a/hello.py\n"
+        "+++ b/hello.py\n"
+        "@@ -0,0 +1,3 @@\n"
+        " def greet():\n"
+        "     return 'hello'\n"
+    )
+
+    # Configure mock to return in sequence
+    mock_create.side_effect = [
+        DummyResponse(bad_diff),     # _build_diff_prompt → no diff
+        DummyResponse(critique),     # _do_reflexion → critique
+        DummyResponse(good_diff)     # Next diff generation
+    ]
+
+    executor = Executor()
+    executor.run_task("T-1")
+
+    # After execution, hello.py should now have greet()
+    content = (demo_repo / "hello.py").read_text()
+    assert "def greet()" in content
+
+    # Task status should be done
+    pm = PlanManager()
+    plan = pm.load_latest_plan()
+    t1 = next(t for t in plan.tasks if t.id == "T-1")
+    assert t1.status == "done"
+
+# --------------------------------------------------------------------------------
+# 3. Failure After Retries: Always bad diff → roll back branch, status=failed
+# --------------------------------------------------------------------------------
+
+@patch("openai.ChatCompletion.create")
+def test_executor_failure_and_rollback(mock_create, demo_repo):
+    # LLM always returns bad diff (empty)
+    mock_create.return_value = DummyResponse("")
+
+    executor = Executor()
+    executor.run_task("T-1")
+
+    # Branch 'agent/T-1' should NOT exist (rolled back)
+    branches = subprocess.check_output(["git", "branch"], cwd=demo_repo).decode()
+    assert "agent/T-1" not in branches
+
+    # hello.py should still be empty
+    content = (demo_repo / "hello.py").read_text()
+    assert content.strip() == ""
+
+    # Task status should be 'failed'
+    pm = PlanManager()
+    plan = pm.load_latest_plan()
+    t1 = next(t for t in plan.tasks if t.id == "T-1")
+    assert t1.status == "failed"
+```
+
+> **Explanation of Test Cases**
+>
+> 1. **`test_executor_happy_path`**:
+>
+>    * Stub LLM to return a valid diff.
+>    * Run `Executor.run_task("T-1")`.
+>    * Verify `hello.py` now contains `greet()`, tests pass, branch `agent/T-1` exists, and task status is `done`.
+> 2. **`test_executor_reflexion_success`**:
+>
+>    * Stub LLM so that:
+>
+>      1. 1st call produces no diff → tests fail → reflexion triggered.
+>      2. 2nd call produces a critique (ignored in code except saved to memory).
+>      3. 3rd call produces correct diff → tests pass → commit → status `done`.
+>    * Verify `hello.py` updated, tests pass, status `done`.
+> 3. **`test_executor_failure_and_rollback`**:
+>
+>    * Stub LLM to always produce empty diff.
+>    * After `max_reflexion_retries=1` and `consecutive_failure_threshold=1`, Executor bails.
+>    * Branch should be deleted, `hello.py` unchanged, status `failed`.
+
+Run:
+
+```bash
+poetry run pytest -q
+```
+
+You should see all Phase VI tests passing (plus earlier phases):
+
+```
+====== test session starts ======
+collected 4 items
+test_executor.py ...
+====== 4 passed in 5.2s ======
+```
+
+---
+
+## 8 Developer Walkthrough for Phase VI
+
+1. **Ensure Environment**
+
+   ```bash
+   poetry install
+   poetry shell
+   ```
+
+2. **Navigate to Demo Repo**
+
+   ```bash
+   cd path/to/demo_repo  # created by test fixture
+   ```
+
+3. **Inspect Initial State**
+
+   ```bash
+   ls
+   hello.py  tests/  .agent.yml  memory/  bm25_index/  # etc.
+   git branch
+   # => * main
+   ```
+
+4. **Run Single Task**
+
+   ```bash
+   agent run --task T-1 --verbose
+   ```
+
+   You should see verbose logs about creating branch, LLM calls, writing diffs, running tests, etc. After success:
+
+   * `hello.py` has `greet()`
+   * `tests/test_hello.py` passes
+   * `git branch` shows `main` and `agent/T-1` (since commit succeeded)
+   * `memory/plans/PLAN_<ts>.yaml` shows `status: done` for T-1
+   * `memory/scratch/T-1.md` includes Thought/Observation logs and final success note.
+
+5. **Simulate Failure & Reflexion**
+
+   ```bash
+   # Edit hello.py to remove greet() to force a fail again
+   echo "" > hello.py  
+   agent run --task T-1
+   ```
+
+   You should see that Executor generates a bad diff first (no change), tests fail, Reflexion invoked, then second diff applies, tests pass, commit made.
+
+6. **Simulate Final Failure**
+
+   ```bash
+   # Stub LLM to always return no diff (edit code outside of this demo)
+   agent run --task T-1
+   ```
+
+   After `max_reflexion_retries=1`, the branch `agent/T-1` is deleted and `task.status == "failed"` in plan.
+
+---
+
+## 9 Phase VI Exit Criteria
+
+Ensure **all** of the following are satisfied before moving to Phase VII:
+
+* [ ] **Executor Class Exists** in `agent/executor.py` with methods:
+
+  * `run_task(task_id)`
+  * `run_all()`
+  * `_react_loop()`, `_build_diff_prompt()`, `_run_tests_and_lint()`, `_do_reflexion()`, `_update_task_status()`, and Git helpers.
+* [ ] **Tool Integration**: Executor uses `invoke_tool` to call:
+
+  * `write_diff`
+  * `run_tests`
+  * `static_analyze`
+* [ ] **Branch & Commit Management**:
+
+  * Creates branch `agent/T-<id>`, commits changes when tests/lint pass.
+  * Rolls back when failures exceed threshold.
+* [ ] **Reflexion Logic**:
+
+  * On test/lint failure, Executor calls `_do_reflexion` once (or up to `max_reflexion_retries`).
+  * Appends critique to memory.
+* [ ] **Plan Status Updates**:
+
+  * On success: task’s `status == "done"`.
+  * On failure: task’s `status == "failed"`.
+* [ ] **Smoke Tests Passing**:
+
+  ```bash
+  poetry run pytest -q
+  ```
+
+  including `test_executor.py` with all three scenarios passing.
+* [ ] **CLI Command Works**:
+
+  * `agent run --task T-<id>` runs that task.
+  * `agent run --all` executes all pending tasks in order.
+
+With these in place, your **Executor (ReAct Loop)** is fully operational. It can autonomously modify code, run tests, self‐critique on failures, commit changes, and update task statuses. In **Phase VII** we will integrate **Skill Library** and refine embedding logic, making the agent continually learn and improve from past successes.

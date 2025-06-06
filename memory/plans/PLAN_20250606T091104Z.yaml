@@ -1,0 +1,11 @@
+---
+tasks:
+- id: T-1
+  description: Implement greet() in hello.py
+  accept_tests:
+  - pytest -q
+  budget:
+    tokens: 500
+    dollars: 0.01
+  owner: agent
+  status: pending

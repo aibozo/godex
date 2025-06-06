@@ -1,0 +1,21 @@
+# Core dependencies for Cokeydex
+typer>=0.9.0
+pydantic>=2.5.0
+pydantic-settings>=2.1.0
+rich>=13.7.0
+pyyaml>=6.0
+portalocker>=2.8.0
+python-dotenv>=1.0.0
+
+# For memory system
+chromadb>=0.4.22
+openai>=1.8.0
+google-generativeai>=0.3.0
+
+# For retrieval system
+scikit-learn>=1.3.0
+joblib>=1.3.0
+numpy>=1.24.0
+
+# For testing
+pytest>=7.4.0

@@ -1,0 +1,1075 @@
+Below is **Phase IX: Continuous Deployment & Monitoring**, in exhaustive detail. We’ll cover:
+
+1. **Motivation & Overview** – why production‐ready deployment and monitoring matter.
+2. **Directory Layout & Dependencies** – new folders, files, and packages.
+3. **Configuration Extensions** – environment variables, thresholds, and endpoints.
+4. **Logging Module** (`agent/monitoring/logger.py`) – a unified logger for agent components.
+5. **Metrics & Telemetry** (`agent/monitoring/metrics.py`) – counters, timers, and basic Prometheus‐style exports.
+6. **CI/CD Integration**
+
+   * GitHub Actions workflows (`.github/workflows/ci.yml`) for linting, testing, and packaging.
+   * Optional GitLab CI (`.gitlab-ci.yml`).
+7. **Health Checks & Alerting** – simple scripts (`healthcheck.py`) to verify index, embeddings, and tool availability.
+8. **Containerization (Docker)** – a `Dockerfile` to package the agent, plus a `docker-compose.yml` for auxiliary services (Chroma, vector DB).
+9. **Automated Tests & Coverage** – ensure new monitoring code is tested; coverage thresholds.
+10. **Performance Profiling & Load Testing** – scripts to measure latency under load.
+11. **Developer Walkthrough** – step‐by‐step deployment and monitoring setup.
+12. **Phase IX Exit Criteria** – checklist of what must be in place and verified before declaring Phase IX complete.
+
+---
+
+## 1 Motivation & Overview
+
+By Phase VIII, our agent uses real embeddings and performs end‐to‐end planning, execution, and skill‐library management. However, to use this in a production or team setting—whether on a shared workstation, in CI, or on a server—we need:
+
+* **Reliable Deployment**: The ability to install, upgrade, and run the agent consistently.
+* **Automated Testing & Linting**: Enforce code quality on every commit/PR.
+* **Continuous Integration (CI)**: Automatically run tests, linters, and basic code execution checks.
+* **Monitoring & Logging**: Capture runtime errors, track performance metrics (e.g., API call counts, retrieval latencies), and alert on failures or resource overuse.
+* **Health Checks**: Periodic verification that essential components—BM25 index, Chroma collections, embedding cache, toolchain—are functional.
+* **Containerization**: Package the agent and its dependencies (Python, tools, vector database) into a Docker image for reproducible environments.
+* **Alerting**: Notify developers if, for example, embedding API credentials expire or Chroma becomes corrupted.
+* **Documentation & Runbooks**: Clear instructions for new team members on how to deploy, monitor, and troubleshoot the agent.
+
+In Phase IX, we’ll add the following pieces:
+
+* A **logging abstraction** to replace ad‐hoc `print()` calls.
+* A **metrics module** to gather counters (e.g., “tasks executed,” “LLM calls made”) and expose a `/metrics` HTTP endpoint.
+* **CI workflows** (GitHub Actions) that run on push/PR to lint (via `ruff`), type‐check (via `mypy`), run tests (`pytest`), and build a Docker image.
+* A **Dockerfile** and `docker-compose.yml` to launch the agent alongside required services (Chroma DB).
+* **Health‐check scripts** that can be scheduled (cron) or run in CI to verify key parts.
+* **Alerting hooks** (e.g., if a health check fails, send email/Slack; for Phase IX we’ll include a placeholder script that logs to `stderr` and lets users wire up alerting).
+* **Tests** for the new monitoring code and CI config (e.g., a test that imports `logger` and verifies log formatting).
+* A **developer guide** showing how to enable monitoring, run the Docker containers, and hook into metrics.
+
+---
+
+## 2 Directory Layout & Dependencies
+
+After Phase VIII, our project tree was:
+
+```
+coding-agent/
+├─ agent/
+│  ├─ config.py
+│  ├─ embeddings/
+│  ├─ retrieval/
+│  ├─ skills/
+│  ├─ tasks/
+│  ├─ memory/
+│  ├─ executor.py
+│  ├─ planner.py
+│  ├─ tools/
+│  └─ monitoring/        ← NEW package for Phase IX
+│      ├─ __init__.py
+│      ├─ logger.py
+│      ├─ metrics.py
+│      └─ healthcheck.py
+├─ cli/
+│  └─ commands/
+│      ├─ new.py
+│      ├─ plan.py
+│      ├─ run.py
+│      └─ monitor.py      ← NEW CLI command to run health checks / start HTTP metrics server
+├─ skills/
+│  ├─ snippets/
+│  └─ metadata.jsonl
+├─ memory/
+│  ├─ scratch/
+│  ├─ archive/
+│  └─ plans/
+├─ bm25_index/
+├─ embeddings-cache/
+├─ tests/
+│  ├─ test_tools.py
+│  ├─ test_memory.py
+│  ├─ test_retrieval.py
+│  ├─ test_planner.py
+│  ├─ test_executor.py
+│  ├─ test_skills.py
+│  ├─ test_embeddings.py
+│  └─ test_monitoring.py ← NEW tests for Phase IX
+├─ .github/
+│  └─ workflows/
+│      ├─ ci.yml         ← GitHub Actions CI pipeline
+│      └─ docker-publish.yml  ← Optional, for publishing Docker image
+├─ .gitlab-ci.yml       ← Optional GitLab CI config
+├─ .env.example         ← Template for environment variables
+├─ .agent.yml
+├─ Dockerfile           ← For building the agent container
+├─ docker-compose.yml   ← To bring up agent + Chroma DB
+├─ healthcheck.sh       ← Optional shell script to run health checks
+├─ pyproject.toml
+└─ README.md
+```
+
+### 2.1 New Python Dependencies
+
+Add to `pyproject.toml` under `[tool.poetry.dependencies]`:
+
+```toml
+loguru = "^0.7.0"          # For structured logging
+prometheus-client = "^0.16.0"  # For exposing metrics
+uvicorn = "^0.22.0"        # Lightweight ASGI server for /metrics endpoint
+fastapi = "^0.105.0"       # For metrics HTTP endpoint
+python-dotenv = "^1.0.0"   # For loading .env files
+```
+
+And under `[tool.poetry.dev-dependencies]`:
+
+```toml
+pytest-cov = "^4.1.0"      # For coverage in CI
+mypy = "^1.5.1"            # Type checking
+ruff = "^0.0.300"          # Linting
+```
+
+Run:
+
+```bash
+poetry update
+```
+
+---
+
+## 3 Configuration Extensions (`agent/config.py`)
+
+Extend `Settings` to include logging and monitoring parameters:
+
+```python
+# coding-agent/agent/config.py
+
+from pydantic import BaseSettings, Field
+from pathlib import Path
+import yaml
+from functools import lru_cache
+
+class Settings(BaseSettings):
+    openai_api_key: str = Field(..., env="OPENAI_API_KEY")
+    anthropic_api_key: str = Field("", env="ANTHROPIC_API_KEY")
+    cost_cap_daily: float = 20.0
+    memory_summarise_threshold: int = 4000
+    model_router_default: str = "gpt-4o-mini"
+    agent_home: Path = Field(Path.cwd(), env="AGENT_HOME")
+
+    # Retrieval & Embeddings (Phase VIII)
+    code_embedding_model: str = Field("text-embedding-3-large", description="Embedding model for code")
+    code_similarity_threshold: float = Field(0.2, description="Threshold for code retrieval")
+    code_retrieval_top_n: int = Field(5, description="Number of code chunks to retrieve")
+    embedding_batch_size: int = Field(32, description="Batch size for embedding")
+
+    skill_embedding_model: str = Field("text-embedding-3-large", description="Embedding model for skills")
+    skill_similarity_threshold: float = Field(0.3, description="Threshold for skill retrieval")
+    skill_retrieval_top_k: int = Field(5, description="Number of top skills to retrieve")
+
+    # Monitoring & Logging (Phase IX)
+    log_level: str = Field("INFO", description="Global log level (DEBUG, INFO, WARNING, ERROR)")
+    log_file: Path = Field(Path("logs/agent.log"), description="File path for log output")
+    metrics_host: str = Field("0.0.0.0", description="Host for metrics HTTP server")
+    metrics_port: int = Field(8000, description="Port for metrics HTTP server")
+    healthcheck_interval: int = Field(3600, description="Interval (in seconds) to run health checks")
+    alert_email: str = Field("", description="Email to send alerts to (if any)")
+    alert_slack_webhook: str = Field("", description="Slack webhook URL for alerts")
+
+    class Config:
+        env_file = ".env"
+        env_file_encoding = "utf-8"
+
+def _load_yaml(path: Path | None):
+    if path and path.exists():
+        with open(path, "r") as fh:
+            return yaml.safe_load(fh) or {}
+    return {}
+
+@lru_cache
+def get_settings(config_path: Path | None = None) -> Settings:
+    file_vals = _load_yaml(config_path or Path(".agent.yml"))
+    return Settings(**file_vals)
+```
+
+> **New Fields Explained**
+>
+> * **`log_level`**: e.g., `"INFO"`, `"DEBUG"`.
+> * **`log_file`**: path to write structured logs (default `logs/agent.log`).
+> * **`metrics_host` / `metrics_port`**: where to serve the `/metrics` endpoint (for Prometheus scraping).
+> * **`healthcheck_interval`**: if a monitoring service runs health checks periodically (cron), use this value.
+> * **`alert_email`** / **`alert_slack_webhook`**: placeholders for future alerting integrations; if set, the health check script will send notifications.
+
+Update your `.agent.yml` accordingly, for example:
+
+```yaml
+# ... existing settings ...
+log_level: "INFO"
+log_file: "logs/agent.log"
+metrics_host: "0.0.0.0"
+metrics_port: 8000
+healthcheck_interval: 3600
+alert_email: "dev-team@example.com"
+# For Slack, you could store the webhook here, e.g. "https://hooks.slack.com/services/XXX/YYY/ZZZ"
+alert_slack_webhook: ""
+```
+
+---
+
+## 4 Logging Module (`agent/monitoring/logger.py`)
+
+Rather than using `print()` or `loguru` directly everywhere, centralize logger configuration:
+
+```python
+# coding-agent/agent/monitoring/logger.py
+
+from loguru import logger
+from pathlib import Path
+import sys
+
+from agent.config import get_settings
+
+def configure_logger():
+    """
+    Configure the global logger (loguru) based on Settings.
+    - Set log level.
+    - Write to stdout and a rotating log file.
+    """
+    settings = get_settings()
+    log_level = settings.log_level.upper()
+    log_file = Path(settings.log_file)
+    log_dir = log_file.parent
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    # Remove default handler
+    logger.remove()
+
+    # Add console (stdout) handler
+    logger.add(sys.stdout, level=log_level, format="<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | <level>{level:^8}</level> | <cyan>{module}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>")
+
+    # Add rotating file handler: 10 MB per file, keep 7 backups
+    logger.add(str(log_file), rotation="10 MB", retention="7 days", level=log_level, encoding="utf-8", 
+               format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level:^8} | {module}:{function}:{line} - {message}")
+
+    logger.info("Logger configured. Level: {}", log_level)
+```
+
+> **Usage**
+> At the top of your main entrypoints (e.g., in `cli/main.py` or `cli/commands/run.py`), import and call `configure_logger()` once:
+
+```python
+# coding-agent/cli/main.py
+
+import typer
+from agent.monitoring.logger import configure_logger
+
+# Configure logging immediately
+configure_logger()
+
+app = typer.Typer(help="Top‐level CLI for Coding Agent")
+
+# … include subcommands …
+```
+
+Then, in any agent module, replace `print(...)` with:
+
+```python
+from loguru import logger
+
+logger.debug("Starting task {}", task.id)
+logger.info("Task {} completed successfully", task.id)
+logger.error("Failed to run tool: {}", err)
+```
+
+---
+
+## 5 Metrics & Telemetry Module (`agent/monitoring/metrics.py`)
+
+Use `prometheus-client` to collect and expose metrics via a simple FastAPI endpoint (served by Uvicorn). Metrics to collect:
+
+* **Counters**:
+
+  * `tasks_executed_total`
+  * `tasks_failed_total`
+  * `llm_calls_total`
+  * `embed_requests_total`
+* **Gauges**:
+
+  * `current_tasks_in_progress`
+  * `last_healthcheck_status{status="ok"/"fail"}`
+* **Histograms**:
+
+  * `task_execution_duration_seconds`
+  * `embedding_request_latency_seconds`
+
+### 5.1 `agent/monitoring/metrics.py`
+
+```python
+# coding-agent/agent/monitoring/metrics.py
+
+from prometheus_client import Counter, Gauge, Histogram, generate_latest, CONTENT_TYPE_LATEST
+from fastapi import FastAPI, Response
+import time
+
+# ---------------------
+# Define Prometheus Metrics
+# ---------------------
+tasks_executed_total = Counter(
+    "tasks_executed_total", "Total number of tasks executed successfully"
+)
+tasks_failed_total = Counter(
+    "tasks_failed_total", "Total number of tasks that failed"
+)
+llm_calls_total = Counter(
+    "llm_calls_total", "Total number of LLM calls made"
+)
+embed_requests_total = Counter(
+    "embed_requests_total", "Total number of embedding API requests made"
+)
+
+current_tasks_in_progress = Gauge(
+    "current_tasks_in_progress", "Number of tasks currently in progress"
+)
+last_healthcheck_timestamp = Gauge(
+    "last_healthcheck_timestamp", "Timestamp of the last health check performed"
+)
+last_healthcheck_status = Gauge(
+    "last_healthcheck_status", "Status of the last health check (1 = OK, 0 = FAIL)"
+)
+
+task_execution_duration = Histogram(
+    "task_execution_duration_seconds", "Duration of task execution in seconds"
+)
+embedding_request_latency = Histogram(
+    "embedding_request_latency_seconds", "Latency of embedding requests"
+)
+
+# ---------------------
+# FastAPI App for /metrics
+# ---------------------
+app = FastAPI(title="Coding Agent Metrics")
+
+@app.get("/metrics")
+def metrics():
+    data = generate_latest()
+    return Response(content=data, media_type=CONTENT_TYPE_LATEST)
+```
+
+> **How to Use**
+>
+> * Import and increment these metrics throughout the agent:
+>
+>   ```python
+>   from agent.monitoring.metrics import tasks_executed_total, llm_calls_total
+>   llm_calls_total.inc()
+>   ```
+> * Wrap LLM calls in timing:
+>
+>   ```python
+>   from agent.monitoring.metrics import embedding_request_latency
+>   with embedding_request_latency.time():
+>       emb = embed_text(text)
+>   ```
+> * Wrap task execution in a timer:
+>
+>   ```python
+>   from agent.monitoring.metrics import task_execution_duration, tasks_executed_total, tasks_failed_total, current_tasks_in_progress
+>   current_tasks_in_progress.inc()
+>   start = time.time()
+>   try:
+>       # ... run task ...
+>       tasks_executed_total.inc()
+>   except Exception:
+>       tasks_failed_total.inc()
+>       raise
+>   finally:
+>       elapsed = time.time() - start
+>       task_execution_duration.observe(elapsed)
+>       current_tasks_in_progress.dec()
+>   ```
+> * Run the metrics app via Uvicorn in a background thread or separate process:
+>
+>   ```bash
+>   uvicorn agent.monitoring.metrics:app --host 0.0.0.0 --port 8000
+>   ```
+
+---
+
+## 6 CI/CD Integration
+
+Continuous Integration ensures that on every push or PR, our code is linted, type‐checked, tested, and packaged. Continuous Deployment can then push a Docker image to a registry.
+
+### 6.1 GitHub Actions Workflow: `.github/workflows/ci.yml`
+
+```yaml
+# coding-agent/.github/workflows/ci.yml
+
+name: CI
+
+on:
+  pull_request:
+    branches: [ main ]
+  push:
+    branches: [ main ]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install poetry
+          poetry install --no-root
+      - name: Lint with RUFF
+        run: poetry run ruff check .
+      - name: Type check with mypy
+        run: poetry run mypy agent
+
+  test:
+    runs-on: ubuntu-latest
+    needs: lint
+    services:
+      # Spawn a Chroma service if needed – for now, Chroma is embedded.
+      # Optionally launch a Redis or other service if used.
+    steps:
+      - uses: actions/checkout@v3
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install poetry
+          poetry install
+      - name: Run tests with coverage
+        run: poetry run pytest --cov=agent --cov-report=xml
+
+  build-docker:
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v3
+      - name: Build Docker image
+        run: |
+          docker build -t myregistry/coding-agent:latest .
+      - name: Log in to registry
+        uses: docker/login-action@v2
+        with:
+          registry: myregistry
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+      - name: Push Docker image
+        run: |
+          docker push myregistry/coding-agent:latest
+
+  # Optional: on a schedule run health checks
+  healthcheck:
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    schedule:
+      - cron: '0 * * * *'  # every hour
+    steps:
+      - uses: actions/checkout@v3
+      - name: Health check
+        run: |
+          chmod +x healthcheck.sh
+          ./healthcheck.sh
+```
+
+> **Jobs Explained**
+>
+> * **`lint`**:
+>
+>   * Checks out code, installs dependencies, runs `ruff` and `mypy`. Fails if any lint or type errors.
+> * **`test`**:
+>
+>   * Runs after `lint`, installs full dependencies (including dev), runs `pytest` with coverage output.
+> * **`build-docker`**:
+>
+>   * Only on `main` branch after tests pass. Builds the Docker image and publishes to a private registry (`myregistry`). Credentials stored in GitHub Secrets.
+> * **`healthcheck`** (scheduled):
+>
+>   * Every hour, executes `healthcheck.sh` (see below). If `healthcheck.sh` returns non‐zero, job fails (notification via GitHub UI or email).
+
+### 6.2 . gitlab-ci.yml (Optional)
+
+If the team uses GitLab:
+
+```yaml
+# coding-agent/.gitlab-ci.yml
+
+stages:
+  - lint
+  - test
+  - build
+  - deploy
+
+variables:
+  PYTHON_VERSION: "3.11"
+
+before_script:
+  - pip install poetry
+  - poetry install
+
+lint:
+  stage: lint
+  script:
+    - poetry run ruff check .
+    - poetry run mypy agent
+
+test:
+  stage: test
+  script:
+    - poetry run pytest --cov=agent --cov-report=xml
+  artifacts:
+    reports:
+      cobertura: coverage.xml
+
+build:
+  stage: build
+  script:
+    - docker build -t registry.example.com/coding-agent:latest .
+  artifacts:
+    paths:
+      - docker-image.tar
+
+deploy:
+  stage: deploy
+  script:
+    - echo "Deploy logic goes here"
+  only:
+    - main
+```
+
+---
+
+## 7 Health Checks & Alerting
+
+Create a Python‐based health check script (`agent/monitoring/healthcheck.py`) and a shell wrapper (`healthcheck.sh`) that:
+
+1. Verifies **BM25 index** can be loaded and can perform a trivial query.
+2. Verifies **Chroma collections** (`codebase`, `skills`) exist and can be queried.
+3. Verifies **Embedding API** is reachable (e.g., embed a test string).
+4. Checks **essential tools** (`git`, `pytest`, `ruff`) are in `PATH`.
+5. Returns exit code `0` if all checks pass, else `1`.
+6. If `alert_email` or `alert_slack_webhook` is set, sends a notification on failure.
+
+### 7.1 `agent/monitoring/healthcheck.py`
+
+```python
+# coding-agent/agent/monitoring/healthcheck.py
+
+import sys
+import subprocess
+import requests
+from agent.config import get_settings
+from agent.retrieval.orchestrator import HybridRetriever
+from agent.skills.manager import SkillManager
+from agent.embeddings.utils import embed_text
+
+def check_bm25():
+    try:
+        hr = HybridRetriever()
+        # Perform a trivial BM25 query (empty or common token)
+        results = hr.bm25.query("test", top_n=1)
+        return True
+    except Exception as e:
+        print(f"[HealthCheck] BM25 failed: {e}")
+        return False
+
+def check_chroma():
+    try:
+        sm = SkillManager()
+        # Query zero‐results: valid call
+        _ = sm.skills_col.get(
+            ids=[],
+            include=["metadatas"]
+        )
+        return True
+    except Exception as e:
+        print(f"[HealthCheck] Chroma skills collection failed: {e}")
+        return False
+
+def check_embedding_api():
+    settings = get_settings()
+    if not settings.openai_api_key:
+        print("[HealthCheck] No OPENAI_API_KEY set")
+        return False
+    try:
+        _ = embed_text("healthcheck")
+        return True
+    except Exception as e:
+        print(f"[HealthCheck] Embedding API failed: {e}")
+        return False
+
+def check_tools():
+    tools = ["git", "pytest", "ruff"]
+    ok = True
+    for tool in tools:
+        if subprocess.call(f"which {tool}", shell=True, stdout=subprocess.DEVNULL) != 0:
+            print(f"[HealthCheck] Tool not found: {tool}")
+            ok = False
+    return ok
+
+def send_alert(message: str):
+    settings = get_settings()
+    if settings.alert_slack_webhook:
+        payload = {"text": f"🚨 HealthCheck failed: {message}"}
+        try:
+            r = requests.post(settings.alert_slack_webhook, json=payload, timeout=5)
+            if r.status_code != 200:
+                print(f"[HealthCheck] Slack alert failed: {r.status_code} {r.text}")
+        except Exception as e:
+            print(f"[HealthCheck] Exception sending Slack alert: {e}")
+    if settings.alert_email:
+        # Placeholder: implement email sending (e.g., via SMTP) if desired.
+        print(f"[HealthCheck] Would send email to {settings.alert_email}: {message}")
+
+def run_all_checks():
+    checks = {
+        "BM25 Index": check_bm25,
+        "Chroma DB": check_chroma,
+        "Embedding API": check_embedding_api,
+        "Essential Tools": check_tools
+    }
+    failed = []
+    for name, fn in checks.items():
+        ok = fn()
+        if not ok:
+            failed.append(name)
+    if failed:
+        msg = ", ".join(failed)
+        print(f"[HealthCheck] FAIL: {msg}")
+        send_alert(msg)
+        sys.exit(1)
+    else:
+        print("[HealthCheck] All checks passed.")
+        sys.exit(0)
+
+if __name__ == "__main__":
+    run_all_checks()
+```
+
+### 7.2 Shell Wrapper: `healthcheck.sh`
+
+```bash
+#!/usr/bin/env bash
+# coding-agent/healthcheck.sh
+
+set -euo pipefail
+
+python - <<'EOF'
+from agent.monitoring.healthcheck import run_all_checks
+if __name__ == "__main__":
+    run_all_checks()
+EOF
+```
+
+Make it executable:
+
+```bash
+chmod +x healthcheck.sh
+```
+
+> **Integrating with CI**
+> In `.github/workflows/ci.yml`, the `healthcheck` job runs `./healthcheck.sh`; on failure, the job will fail and GitHub can send email notifications or integrate with Slack/App alerts.
+
+---
+
+## 8 Containerization (Docker)
+
+Dockerizing ensures reproducible environments for deployment.
+
+### 8.1 `Dockerfile`
+
+```dockerfile
+# coding-agent/Dockerfile
+
+FROM python:3.11-slim
+
+# 1. Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    git \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# 2. Create a non-root user
+ARG USER=agent
+ARG UID=1000
+RUN useradd -m -u $UID $USER
+
+# 3. Set working directory
+WORKDIR /home/agent/app
+
+# 4. Copy pyproject.toml and poetry.lock to leverage caching
+COPY pyproject.toml poetry.lock ./
+RUN pip install --upgrade pip \
+    && pip install poetry \
+    && poetry config virtualenvs.create false \
+    && poetry install --no-dev
+
+# 5. Copy the rest of the code
+COPY . .
+
+# 6. Create directories for logs and embeddings
+RUN mkdir -p /home/agent/app/logs embeds-cache skills/snippets memory/plans memory/scratch bm25_index
+
+# 7. Change ownership
+RUN chown -R agent:agent /home/agent/app
+
+USER agent
+
+# 8. Expose metrics port
+EXPOSE 8000
+
+# 9. Entrypoint: run all health checks, start metrics server
+ENTRYPOINT ["bash", "-lc", "python - <<'EOF'\nfrom agent.monitoring.logger import configure_logger\nconfigure_logger()\nprint('Starting health checks...')\nfrom agent.monitoring.healthcheck import run_all_checks\n# If health checks pass, start metrics HTTP server\nimport uvicorn\nuvicorn.run('agent.monitoring.metrics:app', host='0.0.0.0', port=8000)\nEOF"]
+```
+
+> **How This Works**
+>
+> 1. Base: `python:3.11-slim`.
+> 2. Installs `git`, `curl`, and build tools (needed for some Python dependencies).
+> 3. Creates a non‐root user `agent`.
+> 4. Uses Poetry to install dependencies into the system environment (not a venv).
+> 5. Copies the code, creates necessary directories, sets ownership.
+> 6. Exposes port `8000` (for `/metrics`).
+> 7. Entrypoint script:
+>
+>    * Calls `configure_logger()`.
+>    * Runs all health checks; if any fail, container exits.
+>    * If OK, launches a Uvicorn server serving the `/metrics` endpoint on `0.0.0.0:8000`.
+>    * (Optionally, you could have the executor also start in this container; for Phase IX we focus on monitoring.)
+
+### 8.2 `docker-compose.yml`
+
+```yaml
+# coding-agent/docker-compose.yml
+
+version: '3.8'
+services:
+  agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: coding-agent
+    volumes:
+      - .:/home/agent/app:rw
+      - ./embeddings-cache:/home/agent/app/embeddings-cache
+      - ./skills/snippets:/home/agent/app/skills/snippets
+      - ./memory:/home/agent/app/memory
+      - ./bm25_index:/home/agent/app/bm25_index
+    ports:
+      - "8000:8000"   # Expose metrics
+    environment:
+      - AGENT_HOME=/home/agent/app
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - LOG_LEVEL=INFO
+      - LOG_FILE=/home/agent/app/logs/agent.log
+      - CODE_EMBEDDING_MODEL=text-embedding-3-large
+      - SKILL_EMBEDDING_MODEL=text-embedding-3-large
+      - CODE_SIMILARITY_THRESHOLD=0.2
+      - SKILL_SIMILARITY_THRESHOLD=0.3
+      - METRICS_HOST=0.0.0.0
+      - METRICS_PORT=8000
+      - HEALTHCHECK_INTERVAL=3600
+      - ALERT_EMAIL=   # optional
+      - ALERT_SLACK_WEBHOOK=  # optional
+    command: >
+      bash -lc "
+      python - <<'EOF'
+from agent.monitoring.logger import configure_logger
+configure_logger()
+from agent.monitoring.healthcheck import run_all_checks
+EOF
+      && uvicorn agent.monitoring.metrics:app --host 0.0.0.0 --port 8000
+      "
+```
+
+> **Notes**
+>
+> * Mounts code, embedding caches, skill snippets, and memory folders as volumes so host & container stay in sync.
+> * Exposes `/metrics` on port 8000.
+> * On container start, runs health checks, then starts the metrics server.
+> * Developers can `docker-compose up --build` to spin up monitoring quickly.
+
+---
+
+## 9 Automated Tests & Coverage
+
+Create `tests/test_monitoring.py` to verify logging and health checks:
+
+```python
+# coding-agent/tests/test_monitoring.py
+
+import os
+import subprocess
+import pytest
+from pathlib import Path
+from agent.monitoring.logger import configure_logger
+from agent.monitoring.healthcheck import run_all_checks
+
+# --------------------------------------------------------------------------------
+# Test logger configuration
+# --------------------------------------------------------------------------------
+
+def test_configure_logger_creates_log_file(tmp_path, monkeypatch):
+    # Point log file to a temp path
+    monkeypatch.setenv("AGENT_HOME", str(tmp_path))
+    from agent.config import get_settings
+
+    settings = get_settings()
+    # Override log_file to a known temp file
+    settings.log_file = Path(tmp_path) / "logs" / "agent_test.log"
+
+    configure_logger()
+    # After configuring, the log directory should exist
+    log_dir = settings.log_file.parent
+    assert log_dir.exists()
+    # Emitting a log should create the file
+    from loguru import logger
+    logger.info("Test log entry")
+    assert settings.log_file.exists()
+    content = settings.log_file.read_text()
+    assert "Test log entry" in content
+
+# --------------------------------------------------------------------------------
+# Test healthcheck passes in minimal environment
+# --------------------------------------------------------------------------------
+
+def test_healthcheck_minimal(tmp_path, monkeypatch):
+    # Monkeypatch AGENT_HOME to a minimal directory with no indices
+    monkeypatch.setenv("AGENT_HOME", str(tmp_path))
+    # Create minimal directories
+    (tmp_path / "embeddings-cache").mkdir(parents=True)
+    (tmp_path / "bm25_index").mkdir(parents=True)
+    (tmp_path / "skills").mkdir(parents=True)
+    (tmp_path / "skills" / "snippets").mkdir(parents=True)
+    (tmp_path / "memory" / "plans").mkdir(parents=True)
+    (tmp_path / "memory" / "scratch").mkdir(parents=True)
+
+    # Create a minimal BM25 index structure so HybridRetriever can load
+    from agent.retrieval.bm25_index import BM25Index
+    b = BM25Index(index_dir=str(tmp_path / "bm25_index"))
+    # We won’t actually index, but ensure the directory exists
+
+    # Now call healthcheck (should fail on embedding API or Chroma)
+    # Because OPENAI_API_KEY not set, check that exit code is 1
+    result = subprocess.run(["python", "-c", "from agent.monitoring.healthcheck import run_all_checks; run_all_checks()"], cwd=tmp_path)
+    assert result.returncode != 0
+```
+
+> **Explanation**
+>
+> * **`test_configure_logger_creates_log_file`**:
+>
+>   1. Sets `AGENT_HOME` to a temporary dir.
+>   2. Overrides `settings.log_file` to point inside `tmp_path/logs/agent_test.log`.
+>   3. Calls `configure_logger()`.
+>   4. Logs a test message via `logger.info(...)`.
+>   5. Asserts that the file exists and contains the message.
+> * **`test_healthcheck_minimal`**:
+>
+>   1. Sets up a minimal directory structure under `tmp_path` but does not populate BM25 or Chroma.
+>   2. Calls `run_all_checks()` via a subprocess: since `OPENAI_API_KEY` is missing, healthcheck should exit `1`.
+
+Ensure these and all earlier tests pass:
+
+```bash
+poetry run pytest --maxfail=1 --disable-warnings -q
+```
+
+---
+
+## 10 Performance Profiling & Load Testing (Optional)
+
+For a production environment, you may want to measure:
+
+* **Embedding request latency** under different loads.
+* **LLM call durations**.
+* **Task execution throughput** (tasks per hour).
+
+You can create simple scripts under `agent/monitoring/profiling.py` that generate synthetic load, record histograms (already defined), and export them. For Phase IX, this is **optional**, but you should at least verify that under normal usage (e.g., 5 tasks in a row), the agent does not leak memory or degrade.
+
+---
+
+## 11 Developer Walkthrough
+
+1. **Set Environment Variables**
+
+   ```bash
+   export OPENAI_API_KEY="sk-..."
+   export AGENT_HOME="/path/to/coding-agent"
+   # Optionally:
+   export ALERT_SLACK_WEBHOOK="https://hooks.slack.com/services/XXX/YYY/ZZZ"
+   ```
+
+2. **Configure .env**
+   Copy `.env.example` to `.env` and fill in any missing values (e.g., `OPENAI_API_KEY`, `ALERT_EMAIL`, etc.).
+
+3. **Install Dependencies & Run Locally**
+
+   ```bash
+   poetry install
+   poetry shell
+   # Configure logger
+   python - <<'EOF'
+   ```
+
+from agent.monitoring.logger import configure\_logger
+configure\_logger()
+print("Logger and environment configured.")
+EOF
+
+# Health check
+
+python - <<'EOF'
+from agent.monitoring.healthcheck import run\_all\_checks
+run\_all\_checks()
+EOF
+
+# You should see “All checks passed.” or failures if something is missing.
+
+````
+4. **Start Metrics Server**  
+```bash
+uvicorn agent.monitoring.metrics:app --host 0.0.0.0 --port 8000
+````
+
+Navigate to `http://localhost:8000/metrics` to see Prometheus‐formatted metrics (empty or zeros initially).
+
+5. **Run CI Locally (Optional)**
+
+   ```bash
+   # Lint
+   poetry run ruff check .
+   poetry run mypy agent
+   # Tests
+   poetry run pytest --cov=agent
+   ```
+
+   Ensure zero errors.
+
+6. **Build & Run Docker Container**
+
+   ```bash
+   docker build -t coding-agent:latest .
+   docker run -d \
+     -e OPENAI_API_KEY="${OPENAI_API_KEY}" \
+     -e AGENT_HOME="/app" \
+     -e LOG_LEVEL="INFO" \
+     -p 8000:8000 \
+     coding-agent:latest
+   ```
+
+   * Check container logs:
+
+     ```bash
+     docker logs <container_id>
+     ```
+
+     You should see “Logger configured…” and “All health checks passed.” messages, followed by Uvicorn startup.
+
+7. **Bring Up Full Stack with Docker-Compose**
+   If you need a separate Chroma service or volume mounting:
+
+   ```bash
+   docker-compose up --build
+   ```
+
+   This starts the agent container; you can inspect metrics at `http://localhost:8000/metrics`.
+
+8. **Set Up Scheduled Health Checks (Cron)**
+   On a Linux server, add to crontab:
+
+   ```
+   */30 * * * * cd /path/to/coding-agent && ./healthcheck.sh >> /var/log/agent-health.log 2>&1
+   ```
+
+   This runs health checks every 30 minutes and logs output, sending alerts as configured.
+
+9. **Integrate with Prometheus & Grafana**
+
+   * In your Prometheus config, add:
+
+     ```yaml
+     scrape_configs:
+       - job_name: 'coding_agent'
+         static_configs:
+           - targets: ['<agent_host>:8000']
+     ```
+   * Use Grafana to visualize metrics like `task_execution_duration_seconds_bucket` or `llm_calls_total`.
+
+10. **Release Workflow (GitHub Actions)**
+
+    * On push to `main`, GitHub Actions will run:
+
+      * Lint + type check
+      * Tests + coverage
+      * Build and publish Docker image (if credentials are set)
+      * Run hourly health check via the `healthcheck` job.
+
+---
+
+## 12 Phase IX Exit Criteria
+
+Before declaring Phase IX complete, verify:
+
+1. **Logging**
+
+   * `agent/monitoring/logger.py` exists and is invoked on startup.
+   * Logs appear in both `stdout` and `logs/agent.log`, rotated at 10 MB with 7‐day retention.
+   * `log_level` respects `Settings.log_level`.
+   * All major agent modules (`planner.py`, `executor.py`, `skills/`, `retrieval/`) use `logger` instead of `print()`.
+
+2. **Metrics**
+
+   * `agent/monitoring/metrics.py` defines Prometheus metrics.
+   * `/metrics` endpoint returns valid Prometheus text.
+   * Key metrics (`tasks_executed_total`, `llm_calls_total`, etc.) increment appropriately during normal agent runs.
+   * Metrics server runs under Uvicorn on `metrics_host:metrics_port`.
+
+3. **Health Checks**
+
+   * `agent/monitoring/healthcheck.py` implements checks for BM25, Chroma, embeddings, and tools.
+   * `healthcheck.sh` correctly invokes `run_all_checks()` and returns exit code `0/1`.
+   * Alerts (Slack or email) are sent on failure (if configured).
+   * Tests in `tests/test_monitoring.py` cover logger creation and minimal health check failure.
+
+4. **CI/CD**
+
+   * `.github/workflows/ci.yml` runs `ruff`, `mypy`, `pytest --cov`, and builds/publishes Docker image upon successful test.
+   * `docker-compose.yml` builds the agent container and exposes metrics.
+   * Tests for performance (`pytest-cov` threshold ≥ 80%) pass in CI.
+
+5. **Containerization**
+
+   * `Dockerfile` builds without errors; container on start runs health checks, then exposes `/metrics`.
+   * `docker-compose up` correctly mounts volumes (`embeddings-cache`, `skills/snippets`, `memory/`, `bm25_index`) and starts the agent.
+   * Logs are written to `logs/agent.log` inside the container (accessible via `docker logs`).
+
+6. **Automated Tests & Coverage**
+
+   * All existing tests plus `tests/test_monitoring.py` pass with zero failures.
+   * Coverage report indicates ≥ 80 % coverage for new monitoring code.
+
+7. **Documentation & Runbook**
+
+   * `README.md` updated with Phase IX instructions:
+
+     * How to configure `.env` / `.agent.yml` for logging and metrics.
+     * How to run health checks.
+     * How to view logs and metrics.
+     * How to build and deploy with Docker and GitHub Actions.
+
+8. **Manual Verification**
+
+   * Start the agent locally; confirm logs and metrics appear.
+   * Break one component (e.g., rename `bm25_index`) to force health check failure; confirm alert is logged.
+   * Push a PR with a deliberate lint error; confirm CI fails lint step.
+   * Push a PR with a failing test; confirm CI fails test step.
+
+Once these items are all in place and verified, Phase IX is complete. Your coding agent is now fully **production‐ready**, with continuous integration, robust logging, real‐time metrics, health checks, and containerized deployment.

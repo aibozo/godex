@@ -1,0 +1,11 @@
+---
+tasks:
+- id: T-1
+  description: Test task
+  accept_tests:
+  - echo 'test'
+  budget:
+    tokens: 100
+    dollars: 0.01
+  owner: agent
+  status: pending

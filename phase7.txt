@@ -1,0 +1,1063 @@
+Below is **Phase VII: Skill Library & Continuous Learning**, described in exhaustive detail. By the end of this phase, your agent will automatically record every successful code change (“skill”), store it in a retrievable library, and consult that library to bootstrap future tasks—enabling **compositional reasoning** and faster convergence.
+
+We’ll cover:
+
+1. **Motivation & Overview** – why a Skill Library matters and how it fits.
+2. **Directory Layout Changes** – where to store skill modules and persisted data.
+3. **Configuration Extensions** – new settings for skill curation, embedding parameters, and retrieval thresholds.
+4. **Skill Schema** – a Pydantic model defining what a “skill” is (code snippet, metadata, task provenance).
+5. **Skill Manager** (`agent/skills/manager.py`) – functions to add, query, and persist skills.
+6. **Embedding & Storage** (`agent/skills/embedders.py`) – how we embed code snippets (stubs for now) and store them in a Chroma collection named `"skills"`.
+7. **Retrieval Integration** (`agent/skills/retriever.py`) – a simple class that, given a task description, returns top‐K relevant skills.
+8. **Executor Modifications** (`agent/executor.py` updates) – how we:
+
+   * After a successful commit, extract the final diff, normalize it into a “skill” (e.g., code snippet or patch), and pass it to the Skill Manager.
+   * Before generating a diff for a new task, fetch related skills and prepend them to the LLM prompt as positive examples.
+9. **Tests** (`tests/test_skills.py`) – verifying:
+
+   * We can add a skill, store it, and retrieve it by semantic similarity.
+   * Executor successfully invokes Skill Manager on commit.
+   * Retrieval returns expected skills given a mock description.
+10. **Developer Walkthrough** – step‐by‐step instructions on setting up, adding skills, and seeing them used in practice.
+11. **Phase VII Exit Criteria** – a checklist of what must be implemented and passing before moving to Phase VIII.
+
+Let’s dive in.
+
+---
+
+## 1 Motivation & Overview
+
+By now, the agent can:
+
+* Plan tasks (Phase V).
+* Execute tasks via ReAct loops with diff generation and reflexion (Phase VI).
+
+However, every time it solves a problem (say, “implement authentication flow”), those specific code changes—tests written, refactoring patterns used, configuration updates—are forgotten once the task is marked “done.” In reality, many coding tasks recur or reuse patterns:
+
+* Adding a new API endpoint often involves the same boilerplate.
+* Writing a test often needs the same fixture setup.
+* Refactoring code often follows the same utility functions.
+
+A **Skill Library** captures those successful code fragments (or diffs) as reusable “skills.” In subsequent tasks, the agent can retrieve relevant skills by semantic similarity (e.g., “I need to add a new API route” → see past code that added a similar route) and use them as in‐context examples or directly apply parts. Over time, the agent “learns” a growing catalog of project‐specific patterns.
+
+### Phase VII Goals
+
+1. **Define a Skill Schema**: A Pydantic model that includes:
+
+   * `skill_id` (UUID)
+   * `task_id` (the originating task)
+   * `description` (short text, e.g., “Create greet() function in hello.py”)
+   * `code` (the actual snippet or diff)
+   * `file_path` (where the snippet resides)
+   * `creation_timestamp`
+   * Optional: `embedding` vector (list of floats)
+
+2. **Implement a Skill Manager**:
+
+   * **Add Skills**: After a task’s successful commit, extract relevant code (e.g., the final unified diff or affected functions) and write it to disk (in `skills/` folder) and insert into Chroma’s `"skills"` collection with metadata.
+   * **Persist Metadata**: Maintain a JSONL or SQLite index for quick lookups (Phase VII will use JSONL).
+   * **Query Skills**: Given a natural‐language query (task description), embed it and retrieve the top‐K relevant skills.
+
+3. **Integrate with Executor**:
+
+   * After committing a task, call `SkillManager.add_skill(...)`.
+   * Before building a diff prompt for a new task, call `SkillManager.fetch_skills(task.description, K)` and insert the returned snippets into the LLM prompt as examples under `related_skills`.
+
+4. **Persisted Storage**:
+
+   * Create on‐disk folders:
+
+     ```
+     coding-agent/
+     ├─ skills/
+     │  ├─ snippets/         # Raw code snippets (one .py or .diff per skill)
+     │  ├─ metadata.jsonl    # JSONL with one JSON per skill
+     └─ embeddings/          # existing embeddings folder (Chroma stores multiple collections)
+     ```
+   * In Chroma, create a new collection `"skills"` (parallel to `"memory"` and `"codebase"`).
+
+5. **Stubbed Embeddings** (for now):
+
+   * Return a zero vector of length 768; later phases (VIII) will plug in a real embedding model.
+
+6. **Tests**:
+
+   * Verify that adding a skill results in:
+
+     * A new file under `skills/snippets/skill_<uuid>.diff` (or `.py`).
+     * A new JSON line in `skills/metadata.jsonl`.
+     * A new entry in Chroma’s `"skills"` collection.
+   * Verify that querying a skill library returns the expected snippet (under our stub embedding).
+
+---
+
+## 2 Directory Layout Changes
+
+After Phase VI, your project tree was:
+
+```
+coding-agent/
+├─ agent/
+│  ├─ config.py
+│  ├─ utils/
+│  ├─ tools/
+│  ├─ memory/
+│  ├─ retrieval/
+│  ├─ tasks/
+│  ├─ planner.py
+│  ├─ executor.py
+│  └─ … 
+├─ cli/
+│  └─ commands/
+│     ├─ new.py
+│     ├─ plan.py
+│     └─ run.py
+├─ memory/
+│  ├─ scratch/
+│  ├─ archive/
+│  └─ plans/
+├─ bm25_index/
+│  └─ …
+├─ tests/
+│  ├─ test_tools.py
+│  ├─ test_memory.py
+│  ├─ test_retrieval.py
+│  ├─ test_planner.py
+│  └─ test_executor.py
+├─ .agent.yml
+├─ README.md
+└─ pyproject.toml
+```
+
+### 2.1 Add `agent/skills/` package
+
+```
+coding-agent/
+└─ agent/
+   └─ skills/
+      ├─ __init__.py
+      ├─ schema.py         # Pydantic Skill model
+      ├─ manager.py        # SkillManager implementation
+      ├─ embedders.py      # stub embedder(s) for skills
+      └─ retriever.py      # Simple SkillRetriever class
+```
+
+> **Why this structure?**
+>
+> * `schema.py` defines the in‐memory representation of a skill.
+> * `manager.py` handles adding skills, persisting metadata, writing snippet files, and inserting into Chroma.
+> * `embedders.py` provides `embed_text()` (stub) to produce vector embeddings for code.
+> * `retriever.py` wraps Chroma queries to fetch skills by similarity to a query string.
+
+### 2.2 Add on‐disk “skills” folder
+
+At the repo root, create:
+
+```
+coding-agent/
+├─ skills/
+│  ├─ snippets/         # Stores raw snippet files: one per skill
+│  └─ metadata.jsonl    # Append‐only JSONL file; one JSON object per skill
+```
+
+* **`skills/snippets/`**:
+  Each file named `skill_<UUID>.diff` or `skill_<UUID>.py` (depending on content).
+* **`skills/metadata.jsonl`**:
+  Each line is a JSON object with keys:
+
+  ```json
+  {
+    "skill_id": "uuid-string",
+    "task_id": "T-123",
+    "description": "Short description of the change",
+    "file_path": "relative/path/to/file",
+    "snippet_path": "skills/snippets/skill_<UUID>.diff",
+    "timestamp": "20250612T153000Z"
+  }
+  ```
+
+  We’ll append to this file whenever a new skill is added.
+
+---
+
+## 3 Configuration Extensions (`agent/config.py`)
+
+Extend `Settings` to include skill‐library settings:
+
+```python
+# coding-agent/agent/config.py
+
+from pydantic import BaseSettings, Field
+from pathlib import Path
+import yaml
+from functools import lru_cache
+
+class Settings(BaseSettings):
+    # … existing fields …
+
+    # ----------------------------------------------------
+    # Skill Library settings
+    # ----------------------------------------------------
+    skill_embedding_model: str = Field(
+        "stub", description="Name of embedding model to use for skills"
+    )
+    skill_similarity_threshold: float = Field(
+        0.1, description="Minimum cosine similarity to consider a skill relevant"
+    )
+    skill_retrieval_top_k: int = Field(
+        5, description="Number of top skills to retrieve for a new task"
+    )
+
+    class Config:
+        env_file = ".env"
+        env_file_encoding = "utf-8"
+
+# … get_settings() as before …
+```
+
+> **Field Explanations**
+>
+> * **`skill_embedding_model`**: which model to use for embedding code snippets (currently `"stub"`, later replace with real model name, e.g., `"text-embedding-3-large"`).
+> * **`skill_similarity_threshold`**: only return skills whose similarity ≥ this threshold (currently low for stub).
+> * **`skill_retrieval_top_k`**: how many skills to fetch for each new task (default 5).
+
+---
+
+## 4 Skill Schema (`agent/skills/schema.py`)
+
+Define a Pydantic model for a “Skill”:
+
+```python
+# coding-agent/agent/skills/schema.py
+
+from __future__ import annotations
+from pydantic import BaseModel, Field
+from typing import Optional, List
+import datetime
+import uuid
+
+class Skill(BaseModel):
+    """
+    Represents a reusable code snippet or diff extracted from a completed task.
+    """
+    skill_id: str = Field(..., description="Unique identifier for this skill (UUID)")
+    task_id: str = Field(..., description="ID of the Task that produced this skill")
+    description: str = Field(..., description="Short text describing what this snippet does")
+    file_path: str = Field(..., description="Relative path of the file affected")
+    snippet_path: str = Field(..., description="Relative path to the stored snippet file")
+    timestamp: str = Field(..., description="ISO8601 UTC timestamp when skill was added")
+    embedding: Optional[List[float]] = Field(
+        None, description="Vector embedding for semantic retrieval (length 768)"
+    )
+
+    class Config:
+        schema_extra = {
+            "example": {
+                "skill_id": "e8f8f2d3-3f7f-4e1a-9b1a-1234567890ab",
+                "task_id": "T-101",
+                "description": "Added greet() function to hello.py",
+                "file_path": "hello.py",
+                "snippet_path": "skills/snippets/skill_e8f8f2d3-3f7f-4e1a-9b1a-1234567890ab.diff",
+                "timestamp": "2025-06-12T15:30:00Z",
+                "embedding": [0.0, 0.0, ..., 0.0]  # length 768
+            }
+        }
+```
+
+> **Key Fields**
+>
+> * `skill_id`: auto‐generated UUID.
+> * `task_id`: provenance—so we know which task produced it.
+> * `description`: e.g., “Added greet() function to hello.py.”
+> * `file_path`: “hello.py”
+> * `snippet_path`: e.g., “skills/snippets/skill\_<UUID>.diff”
+> * `timestamp`: recorded in UTC.
+> * `embedding`: a 768‐dim vector (list of floats) for semantic similarity. Initially all zeros for stubs.
+
+---
+
+## 5 Skill Manager (`agent/skills/manager.py`)
+
+The **SkillManager** is responsible for:
+
+1. **Adding** a skill:
+
+   * Generate `skill_id` (UUID).
+   * Write the raw diff or code snippet to `skills/snippets/skill_<UUID>.diff`.
+   * Create a `Skill` object with metadata and a stub embedding.
+   * Append its JSON representation to `skills/metadata.jsonl`.
+   * Insert into Chroma’s `"skills"` collection (embedding + metadata + document).
+
+2. **Loading All Skills** (from metadata.jsonl) into memory (if needed).
+
+3. **Utility**: generating an embedding (via `embedders.embed_text`).
+
+### 5.1 Implementation of `agent/skills/manager.py`
+
+```python
+# coding-agent/agent/skills/manager.py
+
+import os
+import json
+import uuid
+import datetime
+from pathlib import Path
+from typing import Optional, List
+
+import chromadb
+from chromadb.config import Settings as ChromaSettings
+
+from agent.config import get_settings
+from agent.skills.schema import Skill
+from agent.skills.embedders import embed_text
+
+class SkillManager:
+    def __init__(self):
+        self.settings = get_settings()
+        self.home = Path(self.settings.agent_home)
+
+        # Ensure on‐disk directories exist
+        self.skills_dir = self.home / "skills"
+        self.snippets_dir = self.skills_dir / "snippets"
+        self.metadata_file = self.skills_dir / "metadata.jsonl"
+
+        self.snippets_dir.mkdir(parents=True, exist_ok=True)
+        # Create metadata.jsonl if missing
+        if not self.metadata_file.exists():
+            self.metadata_file.write_text("")
+
+        # Initialize Chroma client and "skills" collection
+        persist_dir = str(self.home / "embeddings")
+        os.makedirs(persist_dir, exist_ok=True)
+        self.client = chromadb.Client(ChromaSettings(
+            chroma_db_impl="duckdb+parquet",
+            persist_directory=persist_dir
+        ))
+        try:
+            self.skills_col = self.client.get_collection(
+                name="skills"
+            )
+        except Exception:
+            self.skills_col = self.client.create_collection(
+                name="skills"
+            )
+
+    def add_skill(
+        self,
+        task_id: str,
+        description: str,
+        file_path: str,
+        code_snippet: str
+    ) -> Skill:
+        """
+        Adds a new skill, given:
+          - `task_id`: originating task ID
+          - `description`: text describing the snippet
+          - `file_path`: relative path of file changed
+          - `code_snippet`: raw unified diff or code fragment
+
+        Returns the created Skill object.
+        """
+        # 1. Generate a UUID
+        skill_uuid = str(uuid.uuid4())
+
+        # 2. Determine snippet file name
+        #    If `code_snippet` contains lines starting with '--- ' and '+++ ', treat as diff.
+        #    Otherwise, save as .py
+        is_diff = any(line.startswith("--- ") for line in code_snippet.splitlines())
+        if is_diff:
+            ext = "diff"
+        else:
+            ext = "py"
+        snippet_fn = f"skill_{skill_uuid}.{ext}"
+        snippet_path = self.snippets_dir / snippet_fn
+
+        # 3. Write code_snippet to snippet_path
+        with open(snippet_path, "w", encoding="utf-8") as f:
+            f.write(code_snippet)
+
+        # 4. Create Skill object with stub embedding
+        timestamp = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+        emb = embed_text(code_snippet)  # stub embedding
+        skill = Skill(
+            skill_id=skill_uuid,
+            task_id=task_id,
+            description=description,
+            file_path=file_path,
+            snippet_path=str(snippet_path.relative_to(self.home)),
+            timestamp=timestamp,
+            embedding=emb
+        )
+
+        # 5. Append to metadata.jsonl
+        with open(self.metadata_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(skill.dict(exclude_none=True)) + "\n")
+
+        # 6. Insert into Chroma "skills" collection
+        #    Document = code_snippet, Metadata = everything except embedding
+        metadata = {
+            "skill_id": skill.skill_id,
+            "task_id": skill.task_id,
+            "description": skill.description,
+            "file_path": skill.file_path,
+            "snippet_path": skill.snippet_path,
+            "timestamp": skill.timestamp
+        }
+        # Use skill_id as ID in Chroma
+        self.skills_col.add(
+            ids=[skill.skill_id],
+            embeddings=[skill.embedding],
+            metadatas=[metadata],
+            documents=[code_snippet]
+        )
+
+        return skill
+
+    def load_all_skills(self) -> List[Skill]:
+        """
+        Read metadata.jsonl and return a list of Skill objects.
+        """
+        skills: List[Skill] = []
+        with open(self.metadata_file, "r", encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                data = json.loads(line)
+                skills.append(Skill.parse_obj(data))
+        return skills
+
+    def get_skill_by_id(self, skill_id: str) -> Optional[Skill]:
+        """
+        Return Skill with given ID, or None if not found.
+        """
+        for skill in self.load_all_skills():
+            if skill.skill_id == skill_id:
+                return skill
+        return None
+```
+
+> **Step‐by‐Step Explanation**
+>
+> 1. **Constructor (`__init__`)**
+>
+>    * Reads `agent_home` from settings.
+>    * Creates on‐disk directories: `skills/`, `skills/snippets/`, and an empty `skills/metadata.jsonl` if missing.
+>    * Initializes a Chroma client pointing at `embeddings/` (shared directory).
+>    * Creates or fetches a Chroma collection named `"skills"`.
+> 2. **`add_skill(...)`**
+>
+>    1. Generate a new UUID.
+>    2. Decide file extension: if `code_snippet` starts with unified‐diff markers (`--- `), use `.diff`, else `.py`.
+>    3. Write `code_snippet` to `skills/snippets/skill_<UUID>.<ext>`.
+>    4. Create a `Skill` model with a stubbed embedding via `embed_text(...)`.
+>    5. Append the `Skill`’s JSON to `skills/metadata.jsonl` (one JSON per line).
+>    6. Insert into Chroma’s `"skills"` collection with:
+>
+>       * `ids=[skill_id]`
+>       * `embeddings=[embedding]`
+>       * `metadatas=[metadata dict without embedding]`
+>       * `documents=[code_snippet]`
+> 3. **`load_all_skills()`**
+>
+>    * Reads each non‐blank line of `skills/metadata.jsonl`, parses JSON, constructs a `Skill` object.
+> 4. **`get_skill_by_id(...)`**
+>
+>    * Scans loaded skills to find matching `skill_id`.
+
+---
+
+## 6 Embedding Stubs (`agent/skills/embedders.py`)
+
+For now, we return a zero vector of length 768. In Phase VIII, replace with a call to OpenAI’s embedding API or a local embedder.
+
+```python
+# coding-agent/agent/skills/embedders.py
+
+from typing import List
+from agent.config import get_settings
+
+def embed_text(text: str) -> List[float]:
+    """
+    Return a 768‐dim zero vector for `text`. 
+    Replace this function with actual embedding calls in Phase VIII.
+    """
+    # In real implementation:
+    # settings = get_settings()
+    # openai.api_key = settings.openai_api_key
+    # resp = openai.Embedding.create(
+    #     model=settings.skill_embedding_model,
+    #     input=text
+    # )
+    # return resp["data"][0]["embedding"]
+    return [0.0] * 768
+```
+
+> **Why stub?**
+>
+> * Saves time and dependencies during Phase VII development.
+> * Downstream code (Chroma additions, similarity checks) will work but always return similarity 0, so retrieval will fallback to returning the first K inserted skills.
+
+---
+
+## 7 Skill Retriever (`agent/skills/retriever.py`)
+
+The **SkillRetriever** class wraps Chroma queries to fetch top K skills given a natural‐language description:
+
+* Compute an embedding for the query string.
+* Query the `"skills"` collection for the top `k` nearest neighbors.
+* Return a list of `{skill_id, description, file_path, snippet_path, document (code_snippet), score}`.
+
+### 7.1 Implementation of `agent/skills/retriever.py`
+
+```python
+# coding-agent/agent/skills/retriever.py
+
+from typing import List, Dict, Any
+import numpy as np
+
+import chromadb
+from chromadb.config import Settings as ChromaSettings
+
+from agent.config import get_settings
+from agent.skills.embedders import embed_text
+
+class SkillRetriever:
+    def __init__(self):
+        self.settings = get_settings()
+        self.home = self.settings.agent_home
+
+        # Connect to Chroma client
+        persist_dir = str(self.home / "embeddings")
+        self.client = chromadb.Client(ChromaSettings(
+            chroma_db_impl="duckdb+parquet",
+            persist_directory=persist_dir
+        ))
+        self.skills_col = self.client.get_collection(
+            name="skills"
+        )
+
+    def fetch_skills(
+        self, 
+        query: str, 
+        top_k: Optional[int] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Embed `query` and retrieve top_k skills whose similarity ≥ threshold.
+        Returns a list of dicts with:
+            - skill_id
+            - description
+            - file_path
+            - snippet_path
+            - document (code_snippet)
+            - score (cosine similarity)
+        """
+        if top_k is None:
+            top_k = self.settings.skill_retrieval_top_k
+
+        # 1. Compute query embedding
+        q_emb = embed_text(query)
+
+        # 2. Query Chroma
+        results = self.skills_col.query(
+            query_embeddings=[q_emb],
+            n_results=top_k
+        )
+        ids = results["ids"][0]
+        distances = results["distances"][0]
+        metadatas = results["metadatas"][0]
+        documents = results["documents"][0]
+
+        # 3. Filter by similarity threshold
+        ret: List[Dict[str, Any]] = []
+        for idx, dist, meta, doc in zip(ids, distances, metadatas, documents):
+            # Chroma returns distance = 1 - cosine for normalized embeddings.
+            # With zero vectors, distances are undefined; we treat any as score=0.
+            score = float(1.0 - dist) if dist is not None else 0.0
+            if score >= self.settings.skill_similarity_threshold:
+                ret.append({
+                    "skill_id": idx,
+                    "description": meta.get("description", ""),
+                    "file_path": meta.get("file_path", ""),
+                    "snippet_path": meta.get("snippet_path", ""),
+                    "code_snippet": doc,
+                    "score": score
+                })
+        return ret
+```
+
+> **Explanation**
+>
+> * **Constructor**:
+>
+>   * Loads settings.
+>   * Connects to the Chroma client at `embeddings/`.
+>   * Fetches the existing `"skills"` collection (created by `SkillManager`).
+> * **`fetch_skills(query, top_k)`**:
+>
+>   1. Compute `q_emb = embed_text(query)` (stub).
+>   2. Call `self.skills_col.query(query_embeddings=[q_emb], n_results=top_k)`.
+>
+>      * Returns dictionaries: `"ids"`, `"distances"`, `"metadatas"`, `"documents"`.
+>   3. Convert Chroma’s distance to cosine similarity: `score = 1.0 - distance`.
+>
+>      * (If `distance` is `None` or meaningless, fallback to `0.0`.)
+>   4. Filter any skills whose `score < skill_similarity_threshold`.
+>   5. Return a list of dictionaries summarizing each skill.
+
+---
+
+## 8 Executor Modifications (Integrating Skills)
+
+We now update **`agent/executor.py`** to:
+
+1. **Fetch Skills** at the start of each task’s ReAct loop and include them in the diff prompt.
+2. **Add Skills** after a successful commit.
+
+Below are the necessary changes.
+
+### 8.1 Imports and Initialization
+
+At the top of `executor.py`, add:
+
+```python
+from agent.skills.manager import SkillManager
+from agent.skills.retriever import SkillRetriever
+```
+
+In `Executor.__init__`, instantiate both:
+
+```python
+class Executor:
+    def __init__(self):
+        # … existing code …
+        self.skill_manager = SkillManager()
+        self.skill_retriever = SkillRetriever()
+```
+
+### 8.2 Modify `_build_diff_prompt` to Include Related Skills
+
+Replace existing `_build_diff_prompt` with:
+
+```python
+    # ------------------------------------------------------------
+    # Helper: Build diff prompt for LLM, now with related skills
+    # ------------------------------------------------------------
+    def _build_diff_prompt(self, task: Task, test_failures: str) -> dict:
+        """
+        Constructs the messages list for LLM to generate a diff,
+        now including related skills as positive examples.
+        """
+        # 1. System message
+        system_msg = (
+            "You are a coding agent. Given the current task, generate a unified diff to complete the task. "
+            "You should leverage any related code examples (skills) provided as inspiration. "
+            "Output only valid unified diff format. If no changes are needed, output an empty response."
+        )
+
+        # 2. Fetch related skills
+        related = self.skill_retriever.fetch_skills(task.description)
+        # Format related_skills as YAML list of dicts
+        related_skills = []
+        for skill in related:
+            related_skills.append({
+                "skill_id": skill["skill_id"],
+                "description": skill["description"],
+                "code_snippet": skill["code_snippet"]
+            })
+
+        # 3. Gather code context via Retrieval (same as before)
+        code_chunks = self.retriever.fetch_context(task.description, top_n=5)
+        code_context = []
+        for chunk in code_chunks:
+            code_context.append({
+                "file_path": chunk["file_path"],
+                "start_line": chunk["start_line"],
+                "end_line": chunk["end_line"],
+                "text": chunk["text"]
+            })
+
+        # 4. Gather memory (scratchpad)
+        memory_text = self.mm.read_scratch(task.id)
+
+        # 5. Compose user message as YAML, now with related_skills
+        user_dict = {
+            "task_id": task.id,
+            "description": task.description,
+            "related_skills": related_skills,
+            "code_context": code_context,
+            "test_failures": test_failures or "",
+            "memory": memory_text or ""
+        }
+        user_msg = yaml.safe_dump(user_dict, sort_keys=False)
+
+        return {
+            "messages": [
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg}
+            ]
+        }
+```
+
+> **What Changed?**
+>
+> * After system message, we call `self.skill_retriever.fetch_skills(task.description)` to get top K skills.
+> * We embed `related_skills` (list of small dicts with `skill_id`, `description`, and `code_snippet`) in the user YAML.
+> * The LLM sees concrete examples of past successful code changes and can imitate them.
+
+### 8.3 Add Skill After Successful Commit
+
+In `run_task`, after the block where we commit and mark status **done**, insert:
+
+```python
+            # --- New Phase VII: Add skill to Skill Library ---
+            try:
+                # Read the committed diff to capture the final changes
+                # We can run: git diff HEAD~1 HEAD -- <affected files>
+                diff_proc = subprocess.Popen(
+                    f"git diff HEAD~1 HEAD", shell=True, cwd=self.home,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+                )
+                diff_out, diff_err = diff_proc.communicate(timeout=30)
+                if diff_proc.returncode == 0 and diff_out.strip():
+                    # We'll store the diff as the code_snippet
+                    # Use the first affected file path from task (assuming single-file change)
+                    snippet_file = task.id  # use task.id as placeholder; SkillManager does its own naming
+                    skill = self.skill_manager.add_skill(
+                        task_id=task.id,
+                        description=task.description,
+                        # For simplicity, store file_path as "<multiple>" if diff touches many
+                        file_path="multiple" if "diff --git" in diff_out else task.id,
+                        code_snippet=diff_out
+                    )
+                    self.mm.append_scratch(task.id, f"**Skill added:** {skill.skill_id}")
+                else:
+                    self.mm.append_scratch(task.id, f"**Skill not added:** no diff found or error: {diff_err}")
+            except Exception as e:
+                self.mm.append_scratch(task.id, f"**SkillManager.add_skill error:** {e}")
+            # ---------------------------------------------------
+```
+
+> **Explanation**
+>
+> 1. We run `git diff HEAD~1 HEAD` to grab the most recent commit’s changes as a unified diff.
+> 2. If `diff_out` is non‐empty, that represents the code change for the task.
+> 3. We call `self.skill_manager.add_skill(...)`, passing:
+>
+>    * `task_id` (so we know where it came from).
+>    * `description` (same as task).
+>    * `file_path`: we simplify as `"multiple"` if diff touches multiple files; otherwise, for a single‐file change, we could parse the diff to extract the file path. For Phase VII, storing `"multiple"` is acceptable.
+>    * `code_snippet`: the entire diff text.
+> 4. We append a “Skill added: <UUID>” note to the scratchpad so the agent logs which skill was recorded.
+> 5. If anything goes wrong, append an error note to memory.
+
+---
+
+## 9 Skill Library Tests (`tests/test_skills.py`)
+
+Create a new test file to ensure the skill library works end‐to‐end.
+
+```python
+# coding-agent/tests/test_skills.py
+
+import os
+import sys
+import json
+import uuid
+import tempfile
+import shutil
+import pytest
+from pathlib import Path
+
+import chromadb
+from chromadb.config import Settings as ChromaSettings
+
+from agent.skills.manager import SkillManager
+from agent.skills.schema import Skill
+from agent.skills.retriever import SkillRetriever
+from agent.config import get_settings
+
+# --------------------------------------------------------------------------------
+# 1. Test adding a skill writes snippet file, metadata, and Chroma entry
+# --------------------------------------------------------------------------------
+
+def test_add_skill_creates_files_and_chroma(tmp_path, monkeypatch):
+    # Set up a temporary AGENT_HOME
+    monkeypatch.setenv("AGENT_HOME", str(tmp_path))
+    home = tmp_path
+
+    # Initialize SkillManager
+    sm = SkillManager()
+
+    # Clean any existing Chroma data under embeddings (just in case)
+    embeddings_dir = home / "embeddings"
+    if embeddings_dir.exists():
+        shutil.rmtree(embeddings_dir)
+    embeddings_dir.mkdir()
+
+    # Re-instantiate to ensure fresh Chroma
+    sm = SkillManager()
+
+    # Add a sample skill
+    task_id = "T-XYZ"
+    description = "Add sample function"
+    file_path = "foo.py"
+    code_snippet = "def foo():\n    return 42\n"
+
+    skill = sm.add_skill(task_id, description, file_path, code_snippet)
+
+    # Check snippet file exists
+    snippet_path = home / skill.snippet_path
+    assert snippet_path.exists()
+    assert snippet_path.read_text() == code_snippet
+
+    # Check metadata.jsonl has exactly one line, parse it
+    metadata_file = home / "skills" / "metadata.jsonl"
+    lines = metadata_file.read_text().splitlines()
+    assert len(lines) == 1
+    data = json.loads(lines[0])
+    assert data["skill_id"] == skill.skill_id
+    assert data["task_id"] == task_id
+    assert data["description"] == description
+
+    # Check Chroma has a "skills" collection and contains our skill
+    client = chromadb.Client(ChromaSettings(
+        chroma_db_impl="duckdb+parquet",
+        persist_directory=str(home / "embeddings")
+    ))
+    col = client.get_collection(name="skills")
+    results = col.get(ids=[skill.skill_id], include=["metadatas", "documents"])
+    assert results["metadatas"][0]["skill_id"] == skill.skill_id
+    assert results["documents"][0] == code_snippet
+
+# --------------------------------------------------------------------------------
+# 2. Test retrieving skills by similarity (stub embeddings)
+# --------------------------------------------------------------------------------
+
+def test_fetch_skills_returns_empty_with_stub(tmp_path, monkeypatch):
+    # Create AGENT_HOME
+    monkeypatch.setenv("AGENT_HOME", str(tmp_path))
+    home = tmp_path
+
+    # Initialize and add two skills
+    sm = SkillManager()
+
+    # First skill
+    s1 = sm.add_skill("T-1", "Add greet()", "hello.py", "def greet(): return 'hello'\n")
+    # Second skill
+    s2 = sm.add_skill("T-2", "Add goodbye()", "hello.py", "def goodbye(): return 'bye'\n")
+
+    # Now retrieve with a query; stub embeddings are all zeros → distances are zero or undefined
+    sr = SkillRetriever()
+    skills = sr.fetch_skills("greet", top_k=5)
+    # Because embeddings are zero → similarity=0, which ≥ default threshold 0.1? No. 
+    # So we expect an empty list.
+    assert skills == []
+
+    # If we lower threshold to 0.0, we should get both skills back (in insertion order)
+    settings = get_settings()
+    monkeypatch.setenv("AGENT_HOME", str(tmp_path))  # reapply monkeypatch
+    # Override threshold
+    settings.skill_similarity_threshold = 0.0
+    skills = sr.fetch_skills("greet", top_k=5)
+    ids = [item["skill_id"] for item in skills]
+    assert set(ids) == {s1.skill_id, s2.skill_id}
+
+# --------------------------------------------------------------------------------
+# 3. Test loading all skills returns correct Skill objects
+# --------------------------------------------------------------------------------
+
+def test_load_all_skills_correct(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_HOME", str(tmp_path))
+    sm = SkillManager()
+
+    # Add multiple skills
+    s1 = sm.add_skill("T-1", "Desc1", "file1.py", "code1")
+    s2 = sm.add_skill("T-2", "Desc2", "file2.py", "code2")
+
+    # load_all_skills should return 2 Skill objects
+    loaded = sm.load_all_skills()
+    ids = [sk.skill_id for sk in loaded]
+    assert set(ids) == {s1.skill_id, s2.skill_id}
+
+    # Verify that get_skill_by_id works
+    fetched = sm.get_skill_by_id(s1.skill_id)
+    assert fetched.description == "Desc1"
+    assert fetched.file_path == "file1.py"
+```
+
+> **Explanation of Test Cases**
+>
+> 1. **`test_add_skill_creates_files_and_chroma`**:
+>
+>    * Monkeypatch `AGENT_HOME` to a temporary directory.
+>    * Instantiate `SkillManager`; ensure Chroma directory is fresh.
+>    * Call `add_skill(...)`.
+>    * Verify:
+>
+>      * A snippet file `skills/snippets/skill_<UUID>.py` exists with exact content.
+>      * `skills/metadata.jsonl` has one JSON line matching the returned `Skill`.
+>      * Chroma’s `"skills"` collection contains an entry with matching `skill_id`, `metadata`, and `document` (code snippet).
+> 2. **`test_fetch_skills_returns_empty_with_stub`**:
+>
+>    * Add two skills with different code.
+>    * Call `SkillRetriever.fetch_skills("greet")`.
+>
+>      * Because embeddings are zero vectors → distances are 1 (or ill-defined), so `score = 0`, which is below the default threshold 0.1 → expect an empty list.
+>    * Lower `skill_similarity_threshold` to 0.0, call again → now both skills should return.
+> 3. **`test_load_all_skills_correct`**:
+>
+>    * Add two skills.
+>    * `load_all_skills()` should return two `Skill` instances with correct `skill_id`s.
+>    * `get_skill_by_id(...)` returns the correct `Skill` with matching description and file\_path.
+
+Run tests:
+
+```bash
+poetry run pytest -q
+```
+
+You should see:
+
+```
+====== test session starts ======
+collected 3 items
+tests/test_skills.py ...
+====== 3 passed in 1.2s ======
+```
+
+---
+
+## 10 Developer Walkthrough for Phase VII
+
+1. **Ensure Environment & Dependencies**
+
+   ```bash
+   poetry install
+   poetry shell
+   ```
+
+   (Chroma is already installed from earlier phases.)
+
+2. **Inspect Directory Structure**
+
+   ```bash
+   ls
+   agent/  cli/  memory/  skills/  embeddings/  tests/  .agent.yml  README.md  pyproject.toml
+   ls skills
+   # should show:
+   # metadata.jsonl  snippets/
+   ls skills/snippets
+   # initially empty
+   ```
+
+3. **Add a Skill Manually**
+
+   ```python
+   >>> from agent.skills.manager import SkillManager
+   >>> sm = SkillManager()
+   >>> skill = sm.add_skill(
+   ...     task_id="T-ABC",
+   ...     description="Add hello world function",
+   ...     file_path="hello.py",
+   ...     code_snippet="def hello():\n    print('Hello')\n"
+   ... )
+   >>> print(skill.skill_id)
+   e8f8f2d3-3f7f-4e1a-9b1a-1234567890ab
+   ```
+
+   Check:
+
+   ```bash
+   ls skills/snippets
+   # skill_e8f8f2d3-3f7f-4e1a-9b1a-1234567890ab.py
+   cat skills/metadata.jsonl
+   # one line with JSON matching `skill.dict()`
+   ```
+
+4. **Retrieve a Skill by Query**
+
+   ```python
+   >>> from agent.skills.retriever import SkillRetriever
+   >>> sr = SkillRetriever()
+   >>> sr.fetch_skills("hello function")
+   []
+   # By default, threshold=0.1 and stub embeddings → no result
+   >>> from agent.config import get_settings
+   >>> settings = get_settings()
+   >>> settings.skill_similarity_threshold = 0.0
+   >>> sr.fetch_skills("hello function")
+   [
+     {
+       "skill_id": "e8f8f2d3-3f7f-4e1a-9b1a-1234567890ab",
+       "description": "Add hello world function",
+       "file_path": "hello.py",
+       "snippet_path": "skills/snippets/skill_e8f8f2d3-3f7f-4e1a-9b1a-1234567890ab.py",
+       "code_snippet": "def hello():\n    print('Hello')\n",
+       "score": 0.0
+     }
+   ]
+   ```
+
+5. **Run a Task and Observe Skill Addition**
+
+   * Use the **demo\_repo** from Phase VI (with `hello.py`, `tests/test_hello.py`, and a plan).
+   * Ensure `executor.py` is updated to integrate skills.
+   * Run:
+
+     ```bash
+     agent run --task T-1 --verbose
+     ```
+   * After task completes:
+
+     * Check `hello.py` has `greet()`.
+     * Check `skills/snippets/` contains `skill_<UUID>.diff`.
+     * Check `skills/metadata.jsonl` has a new skill entry.
+     * Check Chroma’s `"skills"` collection now has that entry.
+
+6. **Verify Future Retrieval**
+
+   * Create a new dummy task “Implement greet() again” in plan YAML.
+   * Run:
+
+     ```bash
+     agent run --task T-2 --verbose
+     ```
+   * In Executor logs, observe that `related_skills` (containing the previous “Add greet()” snippet) is passed in the prompt.
+   * The LLM stub (still producing zeros) may ignore it, but logs should show the `related_skills` block under user content.
+
+---
+
+## 11 Phase VII Exit Criteria
+
+Before moving on, verify the following:
+
+* [ ] **Skill Schema**: `agent/skills/schema.py` defines `Skill` with proper fields and validation.
+* [ ] **SkillManager** (`agent/skills/manager.py`):
+
+  * Writing to `skills/snippets/skill_<UUID>.<ext>`.
+  * Appending correct JSON lines to `skills/metadata.jsonl`.
+  * Inserting entries into Chroma `"skills"` collection.
+* [ ] **SkillRetriever** (`agent/skills/retriever.py`):
+
+  * Returns an empty list if `score < threshold`.
+  * Returns top K skills when threshold lowered.
+* [ ] **Executor Integration**:
+
+  * Before each diff generation, calls `SkillRetriever.fetch_skills(...)` and includes `related_skills` in `_build_diff_prompt`.
+  * After successful commit, captures the `git diff HEAD~1 HEAD` output and passes it to `SkillManager.add_skill(...)`.
+  * Appends “Skill added: <UUID>” to memory.
+* [ ] **Tests Passing**:
+
+  ```bash
+  poetry run pytest -q
+  ```
+
+  Should run `test_skills.py` (and earlier tests) with zero failures.
+* [ ] **Manual Verification**:
+
+  1. After running a task, check `skills/snippets/` for a new `.diff` or `.py` file.
+  2. Check `skills/metadata.jsonl` has a matching JSON.
+  3. Use `SkillRetriever.fetch_skills(...)` to retrieve that skill.
+  4. Check Executor logs showing `related_skills` in the prompt.
+
+Once these are complete, your agent has a working **Skill Library**, enabling it to remember and reuse past code changes. In **Phase VIII**, we will replace stubs with **real embeddings** (OpenAI API or local model) and refine retrieval to maximize relevance, closing the loop on **continuous learning**.

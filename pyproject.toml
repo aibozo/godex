@@ -5,10 +5,10 @@ description = "Full-stack SOTA coding agent"
 authors = ["Cokeydex <cokeydex@example.com>"]
 license = "MIT"
 readme = "README.md"
-python = ">=3.11,<3.13"
+python = ">=3.10,<3.13"
 
 [tool.poetry.dependencies]
-python = ">=3.11,<3.13"
+python = ">=3.10,<3.13"
 typer = "^0.9.0"
 pydantic = "^2.5.0"
 pydantic-settings = "^2.1.0"
@@ -35,11 +35,11 @@ cokeydex = "cli.main:app"
 
 [tool.black]
 line-length = 100
-target-version = ["py311"]
+target-version = ["py310"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py311"
+target-version = "py310"
 select = ["E", "F", "I", "W", "B"]
 extend-ignore = ["E501"]
 

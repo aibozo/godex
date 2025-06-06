@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+#
+# coding-agent/ops/git_hooks/post-commit
+#
+# After any commit, reindex codebase.
+#
+echo "Reindexing codebase for retrieval..."
+python3 - <<'EOF'
+import os
+from pathlib import Path
+from agent.retrieval.orchestrator import HybridRetriever
+
+# Assume hook is run from repo root
+repo_root = Path(os.getcwd())
+retriever = HybridRetriever()
+retriever.index_codebase(repo_root)
+print("✅ Codebase reindexing complete!")
+EOF

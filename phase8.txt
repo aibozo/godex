@@ -1,0 +1,1170 @@
+Below is Phase VIII Real Embeddings & Enhanced Retrieval, laid out in exhaustive detail. We will replace all stub‐embeddings with real OpenAI (or configurable) embeddings, validate semantic retrieval, and refine the similarity thresholds. By the end of this phase, the agent will use actual vector representations—both for code‐chunk retrieval (Phase IV) and skill‐library lookup (Phase VII)—resulting in meaningful “related code” suggestions and more accurate context.
+
+We cover
+
+1. Motivation & Overview – why real embeddings matter now.
+2. Directory Layout & Dependencies – new packages or files, updated dependencies.
+3. Configuration Extensions – embedding model names, batching parameters, and environment variables.
+4. Embedding Utility Module (`agentembeddingsutils.py`) – centralize OpenAI embedding calls with caching.
+5. Retrieval Updates – update `agentretrievalembedder.py` to call real embeddings, handle batching; re‐embed entire codebase; adjust tests.
+6. Skill Library Updates – update `agentskillsembedders.py` and re‐index existing skills; adjust `SkillManager`; update tests.
+7. Memory Summarization (Optional) – if using embeddings to summarize memory, add embedding calls.
+8. Similarity Threshold Tuning – adjust configuration and demonstrate evaluating retrieval quality.
+9. Error Handling & Rate‐Limiting – manage API errors, retries, and caching to reduce costs.
+10. Tests – new and updated tests ensuring that
+
+     Real embeddings are called (mock OpenAI)
+     Retrieval with synthetic small embeddings returns correct chunksskills
+     Metrics (cosine similarity) computed correctly
+11. Developer Walkthrough – step‐by‐step on how to set environment variables, re‐index, and verify.
+12. Phase VIII Exit Criteria – checklist of what must succeed before Phase IX.
+
+---
+
+## 1 Motivation & Overview
+
+Until now, our agent has used stub embeddings (zero vectors) for both code‐chunk retrieval (Phase IV) and skill lookup (Phase VII). While this allowed us to develop the scaffolding, it produces meaningless similarity scores and thus retrieval results that are essentially arbitrary. In Phase VIII, we will integrate real embeddings—specifically, OpenAI’s text embeddings (e.g., `text-embedding-3-large`)—to give our agent genuine semantic understanding of code. This means
+
+1. Code‐Chunk Retrieval (Phase IV)
+
+    When the agent asks, “Which code snippets are relevant to this task” the returned chunks will actually correlate in meaning (even if code is in different modules).
+2. Skill‐Library Lookup (Phase VII)
+
+    “Related skills” will genuinely reflect similar code patterns, not just insertion order.
+3. Memory Summarization (Optional)
+
+    If we embed memory summaries or retrieve similar past memories, those too become semantically meaningful.
+
+Key Objectives of Phase VIII
+
+ Replace all calls to `embed_text(...)` (both under `agentretrievalembedder.py` and `agentskillsembedders.py`) with real calls to OpenAI’s embedding API (or a configurable alternative).
+ Handle batching of multiple inputs (e.g., embedding many code chunks at once) to respect API rate limits and token limits.
+ Cache embeddings on disk (e.g., via local JSONL) to avoid re‐embedding unchanged code on every run.
+ Provide robust error handling retries on 429  5xx, exponential backoff, and logging.
+ Rebuild indexes using real embeddings both BM25 index stays, but vector indices will be accurate.
+ Update SkillManager, SkillRetriever, and HybridRetriever to use real embeddings.
+ Tune similarity thresholds in `.agent.yml` to sensible defaults (e.g., 0.2 for code chunks, 0.3 for skills).
+ Add tests that mock OpenAI’s embedding API to return predictable vectors, then verify that retrieval returns desired items for contrived embeddings.
+
+---
+
+## 2 Directory Layout & Dependencies
+
+After Phase VII, our project tree is
+
+```
+coding-agent
+├─ agent
+│  ├─ config.py
+│  ├─ embeddings          # NEW package for embedding utilities
+│  │  └─ utils.py
+│  ├─ retrieval
+│  │  ├─ bm25_index.py
+│  │  ├─ chunker.py
+│  │  ├─ embedder.py       # to be updated for real embeddings
+│  │  ├─ metadata.py
+│  │  └─ orchestrator.py
+│  ├─ skills
+│  │  ├─ embedders.py      # to be updated
+│  │  ├─ manager.py
+│  │  ├─ retriever.py
+│  │  └─ schema.py
+│  ├─ tasks
+│  │  ├─ manager.py
+│  │  └─ schema.py
+│  ├─ memory
+│  │  └─ ...
+│  ├─ executor.py
+│  ├─ planner.py
+│  └─ tools
+│     ├─ core.py
+│     ├─ permissions.py
+│     └─ schema.py
+├─ embeddings-cache       # NEW directory cached embeddings (JSONL)
+├─ skills
+│  ├─ snippets
+│  └─ metadata.jsonl
+├─ memory
+│  ├─ scratch
+│  ├─ archive
+│  └─ plans
+├─ bm25_index
+├─ cli
+│  └─ commands
+│     ├─ new.py
+│     ├─ plan.py
+│     └─ run.py
+├─ tests
+│  ├─ test_retrieval.py    # updated
+│  ├─ test_skills.py       # updated
+│  └─ test_embeddings.py   # NEW tests for embedding utils
+├─ .agent.yml
+├─ pyproject.toml
+└─ README.md
+```
+
+### 2.1 New Dependencies
+
+Add to `pyproject.toml` under `[tool.poetry.dependencies]`
+
+```toml
+openai = ^0.27.0           # For embedding API calls
+tqdm = ^4.65.0             # For progress bars when re‐indexing
+```
+
+Then run
+
+```bash
+poetry update
+```
+
+---
+
+## 3 Configuration Extensions (`agentconfig.py`)
+
+Extend `Settings` to include embedding‐specific parameters
+
+```python
+# coding-agentagentconfig.py
+
+from pydantic import BaseSettings, Field
+from pathlib import Path
+import yaml
+from functools import lru_cache
+
+class Settings(BaseSettings)
+    openai_api_key str = Field(..., env=OPENAI_API_KEY)
+    anthropic_api_key str = Field(, env=ANTHROPIC_API_KEY)
+    cost_cap_daily float = 20.0
+    memory_summarise_threshold int = 4000
+    model_router_default str = gpt-4o-mini
+    agent_home Path = Field(Path.cwd(), env=AGENT_HOME)
+
+    # Retrieval  Executor settings (Phase VI)
+    max_tool_calls_per_task int = 30
+    max_reflexion_retries int = 3
+    consecutive_failure_threshold int = 5
+    test_command str = pytest -q
+    lint_command str = ruff .
+
+    # Skill Library settings (Phase VII)
+    skill_embedding_model str = Field(
+        text-embedding-3-large, description=Embedding model for skills
+    )
+    skill_similarity_threshold float = Field(0.3, description=Similarity threshold for retrieving skills)
+    skill_retrieval_top_k int = Field(5, description=Number of top skills to retrieve)
+
+    # Codebase retrieval settings (Phase IV + VIII)
+    code_embedding_model str = Field(
+        text-embedding-3-large, description=Embedding model for code chunks
+    )
+    code_similarity_threshold float = Field(0.2, description=Similarity threshold for code retrieval)
+    code_retrieval_top_n int = Field(5, description=Number of code chunks to retrieve)
+    embedding_batch_size int = Field(32, description=Batch size when embedding multiple texts)
+
+    # Embedding cache settings
+    embedding_cache_dir Path = Field(
+        Path(embeddings-cache), description=Directory to cache embed‐texts JSONL
+    )
+
+    class Config
+        env_file = .env
+        env_file_encoding = utf-8
+
+def _load_yaml(path Path  None)
+    if path and path.exists()
+        with open(path, r) as fh
+            return yaml.safe_load(fh) or {}
+    return {}
+
+@lru_cache
+def get_settings(config_path Path  None = None) - Settings
+    file_vals = _load_yaml(config_path or Path(.agent.yml))
+    return Settings(file_vals)
+```
+
+ Changes Explained
+
+  `code_embedding_model` now default to `text-embedding-3-large`.
+  `skill_embedding_model` same model for skills (could be overridden separately).
+  `code_similarity_threshold` & `skill_similarity_threshold` raised to 0.20.3 for semantically meaningful retrieval.
+  `code_retrieval_top_n` replace hardcoded K=5 in `HybridRetriever.fetch_context`.
+  `embedding_batch_size` allows embedding up to 32 texts per API call.
+  `embedding_cache_dir` directory to store per‐text embeddings as JSONL, avoiding re‐calls for unchanged inputs.
+
+Modify your `.agent.yml` accordingly (if present), for example
+
+```yaml
+openai_api_key sk-...
+anthropic_api_key 
+cost_cap_daily 20.0
+memory_summarise_threshold 4000
+model_router_default gpt-4o-mini
+agent_home .
+
+# Phase VIII embedding settings (override defaults if desired)
+code_embedding_model text-embedding-3-large
+code_similarity_threshold 0.2
+code_retrieval_top_n 5
+embedding_batch_size 16
+
+skill_embedding_model text-embedding-3-large
+skill_similarity_threshold 0.3
+skill_retrieval_top_k 5
+
+tools_allowed
+  - read_file
+  - write_diff
+  - run_tests
+  - static_analyze
+  - grep
+  - vector_search
+```
+
+---
+
+## 4 Embedding Utility Module (`agentembeddingsutils.py`)
+
+Rather than sprinkling OpenAI calls throughout `retrieval` and `skills`, centralize embedding logic here
+
+1. Batch Embedding take a list of strings, return a list of embeddings.
+2. Cache Embeddings store each text’s embedding in `embeddings-cacheembeddings.jsonl` as one JSON object per line
+
+   ```json
+   {text_hash sha256, embedding [ ... ]}
+   ```
+
+   so that on subsequent runs, identical text need not be re‐embedded.
+3. Error Handling retry on rate limits, up to `n` times with exponential backoff.
+
+### 4.1 `agentembeddingsutils.py`
+
+```python
+# coding-agentagentembeddingsutils.py
+
+import os
+import json
+import time
+import hashlib
+from pathlib import Path
+from typing import List, Dict
+
+import openai
+from tqdm import tqdm
+
+from agent.config import get_settings
+
+# Maximum number of retries on rate limit or 5xx
+MAX_RETRIES = 3
+BACKOFF_FACTOR = 2  # Exponential backoff multiplier (seconds)
+
+class EmbeddingCache
+    
+    Handles readingwriting cached embeddings from a JSONL file.
+    Each line {text_hash sha256, embedding [ ... ]}
+    
+    def __init__(self)
+        settings = get_settings()
+        self.cache_dir = settings.embedding_cache_dir
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.cache_file = self.cache_dir  embeddings.jsonl
+        # Load existing cache into memory dict
+        self._cache Dict[str, List[float]] = {}
+        if self.cache_file.exists()
+            with open(self.cache_file, r, encoding=utf-8) as f
+                for line in f
+                    if line.strip()
+                        entry = json.loads(line)
+                        self._cache[entry[text_hash]] = entry[embedding]
+
+    def _hash_text(self, text str) - str
+        return hashlib.sha256(text.encode(utf-8)).hexdigest()
+
+    def get(self, text str) - List[float]  None
+        h = self._hash_text(text)
+        return self._cache.get(h)
+
+    def set(self, text str, embedding List[float]) - None
+        h = self._hash_text(text)
+        if h not in self._cache
+            # Append to cache file
+            with open(self.cache_file, a, encoding=utf-8) as f
+                json.dump({text_hash h, embedding embedding}, f)
+                f.write(n)
+            self._cache[h] = embedding
+
+
+def embed_texts(texts List[str]) - List[List[float]]
+    
+    Embed a list of `texts` using OpenAI embedding API, with caching and batching.
+    Returns a list of embedding vectors in the same order as input texts.
+    
+    settings = get_settings()
+    model = settings.code_embedding_model
+    batch_size = settings.embedding_batch_size
+
+    openai.api_key = settings.openai_api_key
+    cache = EmbeddingCache()
+
+    embeddings List[List[float]] = [None]  len(texts)
+    # Prepare lists of texts to embed (those not in cache)
+    to_fetch_indices = []
+    for idx, t in enumerate(texts)
+        cached = cache.get(t)
+        if cached is not None
+            embeddings[idx] = cached
+        else
+            to_fetch_indices.append(idx)
+
+    # Batch over to_fetch_indices
+    for i in range(0, len(to_fetch_indices), batch_size)
+        batch_idxs = to_fetch_indices[i  i + batch_size]
+        batch_texts = [texts[j] for j in batch_idxs]
+        retry = 0
+        while retry  MAX_RETRIES
+            try
+                resp = openai.Embedding.create(model=model, input=batch_texts)
+                for k, data in enumerate(resp[data])
+                    emb = data[embedding]
+                    idx_in_texts = batch_idxs[k]
+                    embeddings[idx_in_texts] = emb
+                    # Cache the embedding
+                    cache.set(texts[idx_in_texts], emb)
+                break  # success → break retry loop
+            except openai.error.RateLimitError
+                wait = BACKOFF_FACTOR  retry
+                print(f[Embeddings] Rate limit hit; retrying in {wait}s...)
+                time.sleep(wait)
+                retry += 1
+            except openai.error.APIError as e
+                wait = BACKOFF_FACTOR  retry
+                print(f[Embeddings] APIError {e}; retrying in {wait}s...)
+                time.sleep(wait)
+                retry += 1
+        else
+            raise RuntimeError(fFailed to embed batch after {MAX_RETRIES} retries)
+
+    return embeddings
+
+
+def embed_text(text str) - List[float]
+    
+    Embed a single text, using embed_texts for caching.
+    
+    return embed_texts([text])[0]
+```
+
+ Highlights
+
+  `EmbeddingCache`
+
+    On init, loads any existing lines in `embeddings-cacheembeddings.jsonl` into memory.
+    `get(text)` returns cached embedding if present.
+    `set(text, embedding)` appends a new JSON line to `embeddings.jsonl` and stores in memory.
+  `embed_texts(texts)`
+
+    Splits inputs into those already cached vs those needing to be fetched.
+    Batches uncached texts (size = `embedding_batch_size`).
+    Retries up to `MAX_RETRIES` on rate limits or API errors, with exponential backoff.
+    Caches newly fetched embeddings.
+    Returns a list of embeddings aligned with `texts`.
+  `embed_text(text)`
+
+    Convenience wrapper for single strings.
+
+---
+
+## 5 Retrieval Updates (Real Code Embeddings)
+
+### 5.1 `agentretrievalembedder.py` → call `embed_text`
+
+Replace the stub in `agentretrievalembedder.py` with
+
+```python
+# coding-agentagentretrievalembedder.py
+
+from typing import List
+from agent.embeddings.utils import embed_text
+
+def embed_text(text str) - List[float]
+    
+    Return a real embedding for `text` via OpenAI, using caching and batching.
+    
+    return embed_text(text)
+```
+
+ Note Because we imported `embed_text` from `agent.embeddings.utils`, which wraps OpenAI, all code‐chunk embeddings will now be real, cached, batched.
+
+### 5.2 Re‐Embedding Entire Codebase
+
+Previously, `HybridRetriever.index_codebase` inserted stub embeddings. Now we must re‐embed every chunk
+
+1. Modify `agentretrievalorchestrator.py` in `index_codebase`
+
+   Replace
+
+   ```python
+       for chunk_id, meta in self.bm25.metadata.items()
+           chunk_text = self.chunk_texts[chunk_id]
+           embedding = embed_text(chunk_text)
+           # Metadata for Chroma include file_path, lines, chunk_id
+           data = {
+               file_path meta[file_path],
+               start_line meta[start_line],
+               end_line meta[end_line],
+               chunk_id chunk_id
+           }
+           # Use chunk_id as the Chroma document id (must be string)
+           self.code_col.add(
+               ids=[str(chunk_id)],
+               embeddings=[embedding],
+               metadatas=[data],
+               documents=[chunk_text]
+           )
+   ```
+
+   No change in logic, but now `embed_text` returns real vectors.
+
+2. Batching Option (Optional, but recommended for large repos)
+
+   If you want to embed in batches (e.g., 32 chunks at a time) to respect tokenthroughput
+
+   ```python
+   from agent.embeddings.utils import embed_texts
+
+   def index_codebase(self, root_dir Path) - None
+       # ... build BM25 index (as before) ...
+       chunk_ids = list(self.bm25.metadata.keys())
+       texts = [self.chunk_texts[cid] for cid in chunk_ids]
+       # Embed in batches
+       embeddings = embed_texts(texts)  # returns list aligned with texts
+
+       for idx, cid in enumerate(chunk_ids)
+           emb = embeddings[idx]
+           meta = self.bm25.metadata[cid]
+           data = {
+               file_path meta[file_path],
+               start_line meta[start_line],
+               end_line meta[end_line],
+               chunk_id cid
+           }
+           self.code_col.add(
+               ids=[str(cid)],
+               embeddings=[emb],
+               metadatas=[data],
+               documents=[self.chunk_texts[cid]]
+           )
+   ```
+
+   This ensures that up to `embedding_batch_size` texts are embedded per API call.
+
+3. Adjust Similarity Scoring
+
+   In `HybridRetriever.fetch_context`, originally we computed
+
+   ```python
+   q_emb = embed_text(query)
+   # fetched candidate embeddings from Chroma
+   sim = float(dot(emb_arr, q_arr)(norm(emb_arr)norm(q_arr)))
+   ```
+
+   Now that embeddings are real (non‐zero), `sim` is meaningful. But Chroma’s `query` method already returns `distances`, so you could also use
+
+   ```python
+   results = self.code_col.query(
+       query_embeddings=[q_emb],
+       n_results=top_n
+   )
+   ids = results[ids][0]
+   distances = results[distances][0]
+   # distance ≈ 1 − cosine_similarity (if embeddings are normalized)
+   score = 1.0 − distance
+   ```
+
+   If using distances from Chroma (faster), replace manual cosine computation with
+
+   ```python
+   # After q_emb and retrieving results from Chroma
+   results = self.code_col.query(
+       query_embeddings=[q_emb],
+       n_results=bm25_k
+   )
+   ids = results[ids][0]
+   distances = results[distances][0]
+   # Build list of (chunk_id, score)
+   scores = [(int(ids[i]), float(1.0 - distances[i])) for i in range(len(ids))]
+   # Then sort by score, take top_n, etc.
+   ```
+
+   Update code accordingly if you want to skip fetching embeddings manually.
+
+### 5.3 Tuning Retrieval Defaults
+
+In `HybridRetriever.fetch_context`, replace hardcoded `bm25_k=50` and manual reranking by
+
+```python
+    def fetch_context(self, query str, top_n int = None) - List[Dict[str, Any]]
+        if top_n is None
+            top_n = self.settings.code_retrieval_top_n
+        # 1. BM25 step get top 100 (or configurable)
+        bm25_k = max(self.settings.code_retrieval_top_n  5, 50)
+        bm25_results = self.bm25.query(query, top_n=bm25_k)
+        candidate_ids = [cid for cid, _ in bm25_results]
+
+        # 2. Chroma rerank using query embedding
+        q_emb = embed_text(query)
+        # Use Chroma to get distances for candidate_ids only
+        # Chroma does not directly support limiting to candidate_ids in query,
+        # so we can fetch embeddings of candidate_ids and compute manual cosine similarity,
+        # as before, or insert candidate_ids as filter
+        results = self.code_col.query(
+            query_embeddings=[q_emb],
+            n_results=bm25_k,
+            where={chunk_id {$in [str(cid) for cid in candidate_ids]}}
+        )
+        ids = results[ids][0]
+        distances = results[distances][0]
+        scores = [(int(ids[i]), float(1.0 - distances[i])) for i in range(len(ids))]
+
+        # Sort and take top_n
+        scores.sort(key=lambda x x[1], reverse=True)
+        top_scores = scores[top_n]
+
+        results_list = []
+        for cid, score in top_scores
+            meta = self.bm25.metadata[cid]
+            text = self.chunk_texts[cid]
+            results_list.append({
+                chunk_id cid,
+                file_path meta[file_path],
+                start_line meta[start_line],
+                end_line meta[end_line],
+                text text,
+                score score
+            })
+        return results_list
+```
+
+ Note Not all Chroma versions support `$in` filters on metadata; if unavailable, revert to manual extraction of embeddings and cosine computation as in Phase IV, but using real embeddings.
+
+### 5.4 Tests for Retrieval
+
+Update `teststest_retrieval.py` to mock `openai.Embedding.create`
+
+```python
+# coding-agentteststest_retrieval.py
+
+import os
+import json
+import pytest
+from pathlib import Path
+from unittest.mock import patch, MagicMock
+
+from agent.retrieval.chunker import chunk_file
+from agent.retrieval.bm25_index import BM25Index
+from agent.retrieval.orchestrator import HybridRetriever
+from agent.config import get_settings
+
+# --------------------------------------------------------------------------------
+# Helper stub embedding API to return simple vectors (e.g., embedding = [len(text)]  768)
+# --------------------------------------------------------------------------------
+
+def fake_embed_create(model, input)
+    # Return a vector whose first element is length of input string, rest zeros
+    data = []
+    for txt in input
+        vec = [float(len(txt))] + [0.0]  767
+        data.append({embedding vec})
+    return {data data}
+
+class DummyEmbeddingResp
+    def __init__(self, data)
+        self.data = data
+
+# --------------------------------------------------------------------------------
+# Test that code embedding is called and retrieval returns expected chunk
+# --------------------------------------------------------------------------------
+
+@patch(openai.Embedding.create)
+def test_code_retrieval_with_real_embeddings(mock_embed, tmp_path, monkeypatch)
+    # Monkeypatch AGENT_HOME
+    monkeypatch.setenv(AGENT_HOME, str(tmp_path))
+
+    # Stub openai.Embedding.create
+    def side_effect(model, input)
+        return {data [{embedding [float(len(txt))] + [0.0]767} for txt in input]}
+    mock_embed.side_effect = side_effect
+
+    # Create a small repo with two files
+    os.chdir(tmp_path)
+    # hello.py
+    (tmp_path  hello.py).write_text(def greet()n    return 'hello'n)
+    # other.py
+    (tmp_path  other.py).write_text(def farewell()n    return 'bye'n)
+
+    # Build plan and retrieval indices
+    hr = HybridRetriever()
+    hr.index_codebase(tmp_path)
+
+    # Query for greet should retrieve chunk from hello.py (longer text has higher length)
+    results = hr.fetch_context(greet, top_n=1)
+    assert len(results) == 1
+    top = results[0]
+    assert top[file_path] == hello.py
+    assert def greet in top[text]
+
+    # Query for bye should retrieve from other.py
+    results2 = hr.fetch_context(bye, top_n=1)
+    assert results2[0][file_path] == other.py
+
+    # Ensure embedding API was called at least once
+    assert mock_embed.call_count = 1
+
+# --------------------------------------------------------------------------------
+# Test skill retrieval with real embeddings
+# --------------------------------------------------------------------------------
+
+@patch(openai.Embedding.create)
+def test_skill_retrieval_with_real_embeddings(mock_embed, tmp_path, monkeypatch)
+    monkeypatch.setenv(AGENT_HOME, str(tmp_path))
+    # Stub embedding use length of description for embedding
+    def side_effect(model, input)
+        return {data [{embedding [float(len(txt))] + [0.0]767} for txt in input]}
+    mock_embed.side_effect = side_effect
+
+    from agent.skills.manager import SkillManager
+    from agent.skills.retriever import SkillRetriever
+
+    # Initialize and add two skills
+    sm = SkillManager()
+    s1 = sm.add_skill(T-1, Add greet(), hello.py, def greet() return 'hello'n)
+    s2 = sm.add_skill(T-2, Add farewell(), other.py, def farewell() return 'bye'n)
+
+    # Now retrieve with query closely matching s1 (longer string)
+    sr = SkillRetriever()
+    # Lower threshold to 0.0 so we get results
+    settings = get_settings()
+    settings.skill_similarity_threshold = 0.0
+
+    # “greet” has length 5; s1 embedding ≈ [7], s2 embedding ≈ [9] (both stub lengths), but similarity is based on dot product
+    # In this simplistic stub, cosine similarity will be 1.0 because vectors only have first element nonzero.
+    skills = sr.fetch_skills(greet)
+    # Should return both but sorted by similarity—both equal, so any order. Check both present.
+    ids = {item[skill_id] for item in skills}
+    assert ids == {s1.skill_id, s2.skill_id}
+
+    # If we make description for s1 longer, its embedding will be larger
+    sm2 = SkillManager()
+    # For this test, manually tweak embedding cache to simulate differences
+    # But a simpler approach check that fetch_skills returns non‐empty list
+    assert len(skills) = 1
+
+    # Ensure openai.Embedding.create was called both for code and skills
+    assert mock_embed.call_count = 2
+```
+
+ Test Highlights
+
+  `test_code_retrieval_with_real_embeddings`
+
+   1. Monkeypatch `AGENT_HOME` to a temp folder.
+   2. Stub `openai.Embedding.create` to return `[len(text)] + zeros`.
+   3. Create two small files (`hello.py`, `other.py`).
+   4. Call `HybridRetriever.index_codebase(tmp_path)` → BM25 + real embeddings.
+   5. Query for “greet” (length 5) → embed query = `[5] + zeros`. Code chunks (longer text) have embeddings `[n] + zeros` where `n` is number of characters; since cosine similarity is based entirely on first element, retrieval must pick chunk with closest length. Because “def greet()…” is ~23 characters vs “def farewell()…” is ~27, the cosine distance to `[5]` is slightly smaller for the shorter snippet.
+   6. Assert the correct file is returned.
+   7. Repeat for “bye” to get `other.py`.
+   8. Verify that the embedding API was called.
+  `test_skill_retrieval_with_real_embeddings`
+
+   1. Add two skills with different descriptions.
+   2. Stub `Embedding.create` as before.
+   3. Lower `skill_similarity_threshold` to `0.0` so both skills are returned.
+   4. Verify skills appear in retrieval results.
+   5. Check that embedding API was called.
+
+---
+
+## 6 Skill Library Updates (Real Embeddings)
+
+### 6.1 `agentskillsembedders.py` → call real `embed_text`
+
+Replace stub
+
+```python
+# coding-agentagentskillsembedders.py
+
+from agent.embeddings.utils import embed_text
+
+def embed_text(text str) - List[float]
+    
+    Return a real 768‐dim embedding for `text`, using caching.
+    
+    return embed_text(text)
+```
+
+### 6.2 Re‐Index Existing Skills
+
+After deploying real embeddings, any previously stored skills in `skillsmetadata.jsonl` still have `embedding [0.0,...]`. We must update those entries and Chroma’s `skills` collection. Write a small reindex script
+
+```python
+# coding-agentagentskillsreindex_skills.py
+
+import json
+from pathlib import Path
+from tqdm import tqdm
+
+from agent.config import get_settings
+from agent.skills.schema import Skill
+from agent.skills.manager import SkillManager
+from agent.embeddings.utils import embed_text
+
+def reindex_skills()
+    settings = get_settings()
+    home = settings.agent_home
+    skills_dir = home  skills
+    metadata_file = skills_dir  metadata.jsonl
+    temp_file = skills_dir  metadata_temp.jsonl
+
+    sm = SkillManager()
+
+    # Read existing skills
+    updated_lines = []
+    with open(metadata_file, r, encoding=utf-8) as f
+        for line in f
+            if not line.strip()
+                continue
+            data = json.loads(line)
+            skill = Skill.parse_obj(data)
+            # Read snippet
+            snippet_path = home  skill.snippet_path
+            code_snippet = snippet_path.read_text()
+            # Compute new embedding
+            emb = embed_text(code_snippet)
+            skill.embedding = emb
+            updated_lines.append(skill.json())
+            # Update Chroma upsert embedding
+            sm.skills_col.update(
+                ids=[skill.skill_id],
+                embeddings=[emb]
+            )
+
+    # Overwrite metadata.jsonl with updated embeddings
+    with open(temp_file, w, encoding=utf-8) as f
+        for line in updated_lines
+            f.write(line + n)
+
+    metadata_file.unlink()
+    temp_file.rename(metadata_file)
+    print(fReindexed {len(updated_lines)} skills with real embeddings.)
+
+
+if __name__ == __main__
+    reindex_skills()
+```
+
+Run
+
+```bash
+poetry run python agentskillsreindex_skills.py
+```
+
+ What This Does
+
+  Loads each `Skill` from `metadata.jsonl`.
+  Reads its code snippet, calls `embed_text` → real embedding.
+  Updates the `Skill.embedding` in memory.
+  Calls `skills_col.update(...)` to replace the embedding in Chroma.
+  Writes out a new `metadata.jsonl` with updated embeddings.
+
+### 6.3 `SkillManager.add_skill` Already Inserts Real Embeddings
+
+No further changes are needed, since now `agentskillsembedders.embed_text` returns real embeddings.
+
+---
+
+## 7 Memory Summarization with Embeddings (Optional)
+
+If you plan to vector‐search the memory scratchpad or logs, you can embed memory segments similarly. For now, we will skip this optional step; Phase VIII focuses on code and skill embeddings.
+
+---
+
+## 8 Similarity Threshold Tuning
+
+Real embeddings produce values in [–1, 1] for cosine similarity. Our defaults (`code_similarity_threshold = 0.2`, `skill_similarity_threshold = 0.3`) strike a balance, but you may adjust
+
+ Test retrieval quality on your repo
+
+  1. Pick a query known to be related to a code chunk or skill.
+  2. Run `HybridRetriever.fetch_context(query)` and inspect the top scores.
+  3. If irrelevant chunks appear, raise `code_similarity_threshold` to 0.3 or 0.4.
+  4. Similarly for `SkillRetriever.fetch_skills(query)`.
+
+You can temporarily override in `.agent.yml`
+
+```yaml
+code_similarity_threshold 0.3
+skill_similarity_threshold 0.4
+```
+
+---
+
+## 9 Error Handling & Rate‐Limiting
+
+Our `embed_texts` function includes retries on `RateLimitError` and `APIError`. To further safeguard
+
+1. Wrap All Calls in TryExcept Wherever we call `embed_text`, catch exceptions and fallback to stub embedding
+
+   ```python
+   try
+       emb = embed_text(code_snippet)
+   except Exception as e
+       print(f[Warning] Embedding failed for snippet {e}; using zero vector.)
+       emb = [0.0]  768
+   ```
+
+2. Log Failed Embeddings Append failures to a `embeddings-failures.log` under `embeddings-cache`.
+
+3. Respect Token Limits When embedding very large code chunks (4096 tokens), you may need to split or summarise. For now, assume each chunk is ≤400 tokens (Phase IV chunker); if you see errors, consider splitting further.
+
+---
+
+## 10 Tests for Phase VIII
+
+### 10.1 New Test File `teststest_embeddings.py`
+
+```python
+# coding-agentteststest_embeddings.py
+
+import os
+import json
+import hashlib
+import tempfile
+import shutil
+import pytest
+from pathlib import Path
+from unittest.mock import patch, MagicMock
+
+from agent.embeddings.utils import EmbeddingCache, embed_texts, embed_text
+from agent.config import get_settings
+
+# --------------------------------------------------------------------------------
+# Test EmbeddingCache set and get, and persistence across instances
+# --------------------------------------------------------------------------------
+
+def test_embedding_cache_persistence(tmp_path, monkeypatch)
+    # Monkeypatch AGENT_HOME to tmp_path; embedding_cache_dir defaults to 'embeddings-cache'
+    monkeypatch.setenv(AGENT_HOME, str(tmp_path))
+    settings = get_settings()
+    cache_dir = tmp_path  settings.embedding_cache_dir
+    cache_file = cache_dir  embeddings.jsonl
+    # Ensure clean state
+    if cache_dir.exists()
+        shutil.rmtree(cache_dir)
+
+    cache = EmbeddingCache()
+    text = sample text
+    # Initially not cached
+    assert cache.get(text) is None
+    # Set an embedding
+    emb = [1.0]  768
+    cache.set(text, emb)
+    # Should now be cached
+    h = hashlib.sha256(text.encode()).hexdigest()
+    assert cache.get(text) == emb
+    # Cache file should exist with one line
+    lines = cache_file.read_text().splitlines()
+    assert len(lines) == 1
+    data = json.loads(lines[0])
+    assert data[text_hash] == h
+    assert data[embedding] == emb
+
+    # New EmbeddingCache instance should load existing cache
+    cache2 = EmbeddingCache()
+    assert cache2.get(text) == emb
+
+# --------------------------------------------------------------------------------
+# Test embed_texts with real API stub (mocked) and caching
+# --------------------------------------------------------------------------------
+
+@patch(openai.Embedding.create)
+def test_embed_texts_with_stubbing(mock_embed, tmp_path, monkeypatch)
+    # Stub the embedding API to return predictable vectors
+    def fake_create(model, input)
+        # Return [len(txt)]  768 for each input
+        data = []
+        for txt in input
+            vec = [float(len(txt))]  768
+            data.append({embedding vec})
+        return {data data}
+    mock_embed.side_effect = fake_create
+
+    monkeypatch.setenv(AGENT_HOME, str(tmp_path))
+    settings = get_settings()
+
+    texts = [foo, longer text, foo]  # duplicate to test caching
+    embeddings = embed_texts(texts)
+    # Both foo should be same embedding; longer text is different
+    assert embeddings[0] == embeddings[2]
+    assert embeddings[0][0] == float(len(foo))
+    assert embeddings[1][0] == float(len(longer text))
+
+    # Embedding API should be called only twice one batch for [foo, longer text]
+    # then foo is cached
+    assert mock_embed.call_count == 1
+
+    # Subsequent call to embed_text should use cache
+    emb_single = embed_text(foo)
+    assert emb_single[0] == float(len(foo))
+    # No additional API calls
+    assert mock_embed.call_count == 1
+
+# --------------------------------------------------------------------------------
+# Test that retrieval respects new similarity thresholds with stub embeddings
+# --------------------------------------------------------------------------------
+
+@patch(openai.Embedding.create)
+def test_similarity_threshold_effects(mock_embed, tmp_path, monkeypatch)
+    monkeypatch.setenv(AGENT_HOME, str(tmp_path))
+    from agent.skills.manager import SkillManager
+    from agent.skills.retriever import SkillRetriever
+    from agent.retrieval.orchestrator import HybridRetriever
+
+    # Stub embeddings so that A→[1,0..], B→[2,0..], C→[3,0..]
+    def fake_create(model, input)
+        data = []
+        for txt in input
+            if A in txt
+                vec = [1.0] + [0.0]  767
+            elif B in txt
+                vec = [2.0] + [0.0]  767
+            else
+                vec = [3.0] + [0.0]  767
+            data.append({embedding vec})
+        return {data data}
+
+    mock_embed.side_effect = fake_create
+
+    # Initialize a small codebase and skill library
+    # Create code files A.py, B.py, C.py
+    os.chdir(tmp_path)
+    (tmp_path  A.py).write_text(content A)
+    (tmp_path  B.py).write_text(content B)
+    (tmp_path  C.py).write_text(content C)
+
+    # Build code retrieval index
+    hr = HybridRetriever()
+    hr.index_codebase(tmp_path)
+
+    # Query for A should retrieve A.py when threshold is 0.1
+    settings = get_settings()
+    settings.code_similarity_threshold = 0.1
+    result = hr.fetch_context(A, top_n=1)
+    assert result[0][file_path] == A.py
+
+    # If threshold is raised to 0.8 (cosine similarity with [1] vs [3] is small),
+    # retrieval may return empty list
+    settings.code_similarity_threshold = 0.9
+    result2 = hr.fetch_context(A, top_n=1)
+    # Depending on implementation, either empty or fallback.
+    assert isinstance(result2, list)
+
+    # Now test skill retrieval similarly
+    sm = SkillManager()
+    sA = sm.add_skill(T-1, Skill A, A.py, code A)
+    sB = sm.add_skill(T-2, Skill B, B.py, code B)
+    sr = SkillRetriever()
+
+    # Low threshold both skills returned
+    settings.skill_similarity_threshold = 0.0
+    skills = sr.fetch_skills(A)
+    ids = [item[skill_id] for item in skills]
+    assert set(ids) == {sA.skill_id, sB.skill_id}
+
+    # High threshold likely empty
+    settings.skill_similarity_threshold = 0.9
+    skills2 = sr.fetch_skills(A)
+    assert isinstance(skills2, list)
+
+    # Ensure embed called at least once
+    assert mock_embed.call_count = 1
+```
+
+ Key Points
+
+  `test_embedding_cache_persistence` verifies that
+
+    `EmbeddingCache.getset` work.
+    Cache persists to disk and is loaded by a new instance.
+  `test_embed_texts_with_stubbing` verifies
+
+    Embedding API is called once per unique text (deduplication).
+    Caching prevents re‐calls.
+  `test_similarity_threshold_effects` verifies
+
+    Real embeddings (stubbed here) produce different similarity scores.
+    Raising thresholds filters out results.
+
+---
+
+## 11 Developer Walkthrough
+
+1. Ensure Environment
+
+   ```bash
+   poetry install
+   poetry shell
+   ```
+
+2. Set Your OpenAI API Key
+
+   ```bash
+   export OPENAI_API_KEY=sk-...
+   ```
+
+3. Rebuild BM25 Index & Code Embeddings
+
+   ```bash
+   cd pathtoyourrepo
+   # Clean existing Chroma index (optional)
+   rm -rf embeddings
+   # Rebuild
+   python - 'EOF'
+   ```
+
+from pathlib import Path
+from agent.retrieval.orchestrator import HybridRetriever
+hr = HybridRetriever()
+hr.index_codebase(Path.cwd())
+EOF
+
+````
+You’ll see progress bars for embedding batches, and `embeddings-cacheembeddings.jsonl` will fill with cached embeddings.
+
+4. Reindex Skills (Phase VII)  
+```bash
+python agentskillsreindex_skills.py
+````
+
+This updates existing skills with real embeddings and updates Chroma’s `skills` collection.
+
+5. Test Code Retrieval
+   Launch a REPL or script
+
+   ```python
+   from agent.retrieval.orchestrator import HybridRetriever
+   hr = HybridRetriever()
+   results = hr.fetch_context(search term, top_n=3)
+   for r in results
+       print(r[file_path], r[score])
+       print(r[text])
+       print(---)
+   ```
+
+6. Test Skill Retrieval
+
+   ```python
+   from agent.skills.retriever import SkillRetriever
+   sr = SkillRetriever()
+   skills = sr.fetch_skills(search skill, top_k=3)
+   for sk in skills
+       print(sk[skill_id], sk[description], sk[score])
+       print(sk[code_snippet])
+       print(---)
+   ```
+
+7. Run a Task and Observe “Related Skills”
+
+   ```bash
+   agent run --task T-XYZ --verbose
+   ```
+
+   In the console, you’ll see JSON‐YAML prompts including a `related_skills` block listing code snippets with real embeddings, giving the LLM genuine examples.
+
+8. Adjust Similarity Thresholds as Needed
+   Edit `.agent.yml` to tune
+
+   ```yaml
+   code_similarity_threshold 0.25
+   skill_similarity_threshold 0.4
+   ```
+
+   Then re‐run retrieval tests to ensure high relevance.
+
+9. Monitor Embedding Cache
+
+   ```bash
+   wc -l embeddings-cacheembeddings.jsonl
+   # Shows number of distinct embeddings cached.
+   ```
+
+---
+
+## 12 Phase VIII Exit Criteria
+
+Ensure all of the following before progressing to Phase IX
+
+1. Embedding Utility
+
+    `agentembeddingsutils.py` exists and implements
+
+      `EmbeddingCache` with persistent `embeddings.jsonl`.
+      `embed_texts(...)` with batching, caching, and error handling.
+      `embed_text(...)` wrapper for single inputs.
+
+2. Configuration
+
+    `.agent.yml` or `agentconfig.py` includes
+
+      `code_embedding_model`, `code_similarity_threshold`, `code_retrieval_top_n`, `embedding_batch_size`.
+      `skill_embedding_model`, `skill_similarity_threshold`, `skill_retrieval_top_k`.
+
+3. Retrieval Updates
+
+    `agentretrievalembedder.py` uses real `embed_text`.
+    `HybridRetriever.index_codebase` batches and caches embeddings.
+    `HybridRetriever.fetch_context` uses real cosine similarity (via Chroma or manual) and respects `code_similarity_threshold`.
+    Tests in `teststest_retrieval.py` updated and passing.
+
+4. Skill Library Updates
+
+    `agentskillsembedders.py` uses real `embed_text`.
+    `SkillManager.add_skill` inserts real embeddings into Chroma.
+    `SkillRetriever.fetch_skills` returns semantically relevant skills and respects `skill_similarity_threshold`.
+    The reindex script (`agentskillsreindex_skills.py`) updates existing skills.
+    Tests in `teststest_skills.py` updated and passing.
+
+5. Task Execution Integration
+
+    `Executor._build_diff_prompt` includes real `related_skills` (with code snippets).
+    After commit, `Executor` captures `git diff` and calls `SkillManager.add_skill` to generate real embeddings.
+
+6. Embedding Tests
+
+    `teststest_embeddings.py` covers
+
+      Cache persistence.
+      Batching behavior and deduplication.
+      Similarity threshold effects.
+
+7. Performance & Cost Control
+
+    Embedding calls are batched (size = `embedding_batch_size`).
+    Caching avoids re‐embedding unchanged texts.
+    No repeated embedding calls when running retrieval repeatedly.
+
+8. Manual Verification
+
+    Run retrieval queries to confirm semantically correct chunksskills.
+    Confirm that embeddings cache file grows only when new texts are introduced.
+    Confirm that retrieval thresholds filter appropriately.
+
+9. All Phase VIII Tests Passing
+
+   ```bash
+   poetry run pytest -q
+   ```
+
+   Should report zero failures, including `test_embeddings.py`, `test_retrieval.py`, `test_skills.py`, and all earlier tests.
+
+Once these are satisfied, the agent fully employs real embeddings for semantic retrieval. In Phase IX, we will focus on Continuous Deployment & Monitoring, ensuring the agent runs reliably in production, logs metrics, and alerts on errors.

@@ -1,0 +1,1217 @@
+Below is **Phase X: Telemetry & Cost Control**, laid out in exhaustive detail. We will implement:
+
+1. **Token Usage Logging** – capture per‐call input/output token counts and compute cost.
+2. **OpenTelemetry Instrumentation** – add tracing and metric spans around LLM, embedding, and tool calls.
+3. **Cost Thresholds & Kill Switch** – enforce daily and per‐task cost caps based on model‐specific rates; automatically halt or downgrade the agent if exceeded.
+4. **Metrics Format & Export** – extend Prometheus metrics to include token and cost counters; export via `/metrics`.
+
+By the end of this phase, the agent will track exactly how many tokens of each model it consumes, compute the monetary cost, refuse additional calls once budgeted limits are reached, and expose detailed telemetry (traces + metrics) that can be scraped or sent to an OTLP backend.
+
+---
+
+## 1 Motivation & Overview
+
+As we integrate more capable (and expensive) LLMs—O3, Opus 4, Gemini 2.5, GPT-4.1 “full”, GPT-4.1 “nano”—their per-token prices vary widely. Without careful accounting, a long run (e.g., indexing a large codebase, executing many tasks) could incur thousands of dollars in API charges. To operate safely in production, we need:
+
+1. **Precise Token Accounting**: For each request to OpenAI (or Anthropic), record `prompt_tokens`, `completion_tokens`, and aggregate them by model and by time period.
+
+2. **Cost Computation**: Given a lookup table of `$ per 1,000 tokens` for input and output per model, compute the exact dollar amount spent per call.
+
+3. **Budget Enforcement**:
+
+   * A **daily cost cap** (e.g. \$20/day) loaded from configuration.
+   * A **per‐task cost cap** (e.g. \$0.50/task).
+   * If either would be exceeded by a new call, the agent must refuse or fallback (kill switch).
+
+4. **Telemetry & Tracing**: Use **OpenTelemetry** to instrument:
+
+   * LLM calls (span per call, annotated with model, tokens, cost).
+   * Embedding calls.
+   * Tool‐invocations.
+   * Task execution as a parent span (so we can see latencies end‐to‐end).
+   * Export traces either to a local OTLP collector or to logs.
+
+5. **Exported Metrics**: Extend our Prometheus metrics to include:
+
+   * `tokens_input_total{model="gpt-4.1-full"}` and `tokens_output_total{model="gpt-4.1-full"}` counters.
+   * `cost_total{model="gpt-4.1-full"}` counter (\$ spent).
+   * `cost_per_task{task_id="T-123",model="gpt-4.1-full"}` gauge.
+   * A gauge for `cost_remaining_today`.
+
+6. **Alerts on Budget Breach**:
+
+   * If daily cap is reached, send an alert (Slack or email) and disable further LLM calls until the next UTC day.
+   * If per‐task cap is breached, mark the task as failed with a specific “cost\_exceeded” status.
+
+Below we break down each piece in detail.
+
+---
+
+## 2 Directory Layout & Dependencies
+
+After Phase IX, our project tree is:
+
+```
+coding-agent/
+├─ agent/
+│  ├─ config.py
+│  ├─ embeddings/
+│  ├─ retrieval/
+│  ├─ skills/
+│  ├─ tasks/
+│  ├─ memory/
+│  ├─ executor.py
+│  ├─ planner.py
+│  ├─ tools/
+│  └─ monitoring/
+│      ├─ logger.py
+│      ├─ metrics.py
+│      ├─ healthcheck.py
+│      └─ profiling.py (optional)
+├─ cli/
+│  └─ commands/
+│      ├─ new.py
+│      ├─ plan.py
+│      ├─ run.py
+│      ├─ monitor.py
+│      └─ pricing.py        ← NEW CLI for querying current cost usage
+├─ skills/
+│  ├─ snippets/
+│  └─ metadata.jsonl
+├─ memory/
+│  ├─ scratch/
+│  ├─ archive/
+│  └─ plans/
+├─ bm25_index/
+├─ embeddings-cache/
+├─ logs/
+│  └─ agent.log
+├─ .github/
+│  └─ workflows/
+│      └─ ci.yml
+├─ Dockerfile
+├─ docker-compose.yml
+├─ healthcheck.sh
+├─ .env.example
+├─ .agent.yml
+├─ pricing.json         ← NEW: model‐to‐cost mapping
+├─ pyproject.toml
+└─ README.md
+```
+
+### 2.1 New Dependencies
+
+Add to `pyproject.toml` under `[tool.poetry.dependencies]`:
+
+```toml
+opentelemetry-api = "^1.17.0"
+opentelemetry-sdk = "^1.17.0"
+opentelemetry-instrumentation = "^0.39b0"
+opentelemetry-exporter-otlp = "^1.14.0"
+```
+
+Run:
+
+```bash
+poetry update
+```
+
+This brings in the OpenTelemetry API, SDK, and a generic OTLP exporter. We will:
+
+* Use **OTLP** to optionally send traces to an external collector (e.g. Honeycomb, Datadog, Jaeger).
+* Also record cost metrics to Prometheus via `agent/monitoring/metrics.py`.
+
+---
+
+## 3 Configuration Extensions (`agent/config.py`)
+
+We need to know:
+
+* **Per-model cost rates** (input vs. output, per 1,000 tokens).
+* **Daily & per-task budgets**.
+* **Kill switch behavior** (whether to downgrade to a cheaper model or outright refuse).
+
+Extend `Settings`:
+
+```python
+# coding-agent/agent/config.py
+
+from pydantic import BaseSettings, Field
+from pathlib import Path
+import yaml
+from functools import lru_cache
+from typing import Dict
+
+class ModelCost(BaseSettings):
+    input_per_1k: float  # dollars per 1,000 input tokens
+    output_per_1k: float  # dollars per 1,000 output tokens
+
+class Settings(BaseSettings):
+    # … existing fields …
+
+    # --------------------------------
+    # Telemetry & Cost Control (Phase X)
+    # --------------------------------
+    # Path to pricing file mapping model → cost rates
+    pricing_file: Path = Field(Path("pricing.json"), description="JSON file mapping models to their per-token costs")
+
+    # Daily and per-task caps ($)
+    daily_cost_cap: float = Field(20.0, description="Maximum $ to spend per UTC day")
+    per_task_cost_cap: float = Field(0.5, description="Maximum $ to spend per individual task")
+
+    # Kill switch options: 'disable', 'fallback'
+    cost_exceeded_behavior: str = Field("disable", description="Action when budget exceeded: 'disable' or 'fallback'")
+
+    # Fallback model (when cost exceed and fallback mode)
+    fallback_model: str = Field("gpt-4o-mini", description="Model to use if cost threshold is reached")
+
+    # OpenTelemetry settings
+    otlp_endpoint: str = Field("", description="OTLP endpoint URL for exporting traces (if empty, no OTLP export)")
+    otlp_headers: Dict[str, str] = Field({}, description="Optional headers for OTLP exporter")
+
+    class Config:
+        env_file = ".env"
+        env_file_encoding = "utf-8"
+
+def _load_yaml(path: Path | None):
+    # … same as before …
+    if path and path.exists():
+        with open(path, "r") as fh:
+            return yaml.safe_load(fh) or {}
+    return {}
+
+@lru_cache
+def get_settings(config_path: Path | None = None) -> Settings:
+    file_vals = _load_yaml(config_path or Path(".agent.yml"))
+    return Settings(**file_vals)
+```
+
+> **New Fields Explained**
+>
+> * **`pricing_file`**: a JSON file (to be created) that maps each known model (e.g., `"gpt-4o-mini"`, `"gpt-4o-full"`, `"claude-4-opus"`, `"gemini-2.5"`, `"gpt-4o-nano"`) to a dictionary:
+>
+>   ```json
+>   {
+>     "gpt-4o-full": {"input_per_1k": 0.06, "output_per_1k": 0.12},
+>     "gpt-4o-nano": {"input_per_1k": 0.003, "output_per_1k": 0.006},
+>     "claude-4-opus": {"input_per_1k": 0.035, "output_per_1k": 0.07},
+>     "gemini-2.5": {"input_per_1k": 0.05, "output_per_1k": 0.10},
+>     "gpt-3.5-turbo": {"input_per_1k": 0.0015, "output_per_1k": 0.002},
+>     // …etc…
+>   }
+>   ```
+> * **`daily_cost_cap`** & **`per_task_cost_cap`**: budgets in dollars.
+> * **`cost_exceeded_behavior`**:
+>
+>   * `"disable"`: once any cap is exceeded, refuse further calls (fail tasks).
+>   * `"fallback"`: switch to using `fallback_model` for subsequent calls (cheaper, even if lower capability).
+> * **`fallback_model`**: e.g. `"gpt-4o-nano"` or `"gpt-3.5-turbo"`.
+> * **`otlp_endpoint`** & **`otlp_headers`**: if set, the agent will export OpenTelemetry traces there.
+
+Ensure `.agent.yml` or `.env` sets `pricing_file: "pricing.json"` (default), and optionally override daily/per-task caps.
+
+---
+
+## 4 Pricing File (`pricing.json`)
+
+At the repo root, create a file named `pricing.json`:
+
+```json
+{
+  "gpt-4o-full": {"input_per_1k": 0.03, "output_per_1k": 0.06},
+  "gpt-4o-mini": {"input_per_1k": 0.015, "output_per_1k": 0.03},
+  "gpt-4o-nano": {"input_per_1k": 0.003, "output_per_1k": 0.006},
+  "claude-4-opus": {"input_per_1k": 0.035, "output_per_1k": 0.07},
+  "gemini-2.5": {"input_per_1k": 0.05, "output_per_1k": 0.10},
+  "gpt-3.5-turbo": {"input_per_1k": 0.0015, "output_per_1k": 0.002}
+}
+```
+
+Adjust rates to match current published pricing. If a model is missing, cost defaults to 0 (or we treat as “unsupported” and refuse).
+
+---
+
+## 5 Token & Cost Tracking Module (`agent/monitoring/costs.py`)
+
+Create a new module to:
+
+1. **Load `pricing.json`** into a dictionary of `ModelCost` dataclasses.
+2. **Maintain in‐memory counters** for each model’s total `tokens_input`, `tokens_output`, and `cost`.
+3. **Persist daily accumulators** to disk (`logs/costs_YYYYMMDD.json`) so that on restart, we don’t lose counts.
+4. **Expose functions** to:
+
+   * `record_usage(model: str, prompt_tokens: int, completion_tokens: int)` → updates counters, computes cost.
+   * `get_daily_spent()` → returns total cost today.
+   * `get_task_spent(task_id: str)` → track cost per task (requires passing `task_id` context).
+   * `can_spend(model: str, prompt_tokens: int, completion_tokens: int, task_id: str) → bool` → checks both daily and per-task caps.
+   * `get_remaining_budget()` → returns `$` left today.
+
+### 5.1 Implementation: `agent/monitoring/costs.py`
+
+```python
+# coding-agent/agent/monitoring/costs.py
+
+import os
+import json
+import datetime
+from pathlib import Path
+from threading import Lock
+from typing import Dict
+
+from agent.config import get_settings
+
+class ModelCost:
+    def __init__(self, input_per_1k: float, output_per_1k: float):
+        self.input_per_1k = input_per_1k
+        self.output_per_1k = output_per_1k
+
+class CostManager:
+    """
+    Tracks token usage and cost per model, per day, and per task.
+    """
+    def __init__(self):
+        self.settings = get_settings()
+        self.home = Path(self.settings.agent_home)
+        self.lock = Lock()
+
+        # Load pricing file
+        with open(self.home / self.settings.pricing_file, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        self.pricing: Dict[str, ModelCost] = {
+            m: ModelCost(v["input_per_1k"], v["output_per_1k"]) for m, v in raw.items()
+        }
+
+        # In-memory counters for today (reset at midnight UTC)
+        # Structure: {model: {"input_tokens": int, "output_tokens": int, "cost": float}}
+        self.today = datetime.datetime.utcnow().strftime("%Y%m%d")
+        self.daily_counters: Dict[str, Dict[str, float]] = {}
+
+        # Per-task counters: {task_id: cost_total}
+        self.task_counters: Dict[str, float] = {}
+
+        # Load persisted data if exists
+        self._load_daily_counters()
+
+    def _daily_file(self) -> Path:
+        return self.home / "logs" / f"costs_{self.today}.json"
+
+    def _load_daily_counters(self):
+        """
+        If a costs_YYYYMMDD.json exists, load it; otherwise initialize.
+        """
+        file = self._daily_file()
+        if file.exists():
+            with open(file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self.daily_counters = data.get("daily_counters", {})
+            self.task_counters = data.get("task_counters", {})
+        else:
+            self.daily_counters = {}
+            self.task_counters = {}
+            self._persist_daily_counters()
+
+    def _persist_daily_counters(self):
+        """
+        Write counters to disk so they survive restarts.
+        Format:
+        {
+          "daily_counters": {model: {"input_tokens": X, "output_tokens": Y, "cost": Z}, ...},
+          "task_counters": {task_id: cost, ...}
+        }
+        """
+        file = self._daily_file()
+        file.parent.mkdir(parents=True, exist_ok=True)
+        with open(file, "w", encoding="utf-8") as f:
+            json.dump({
+                "daily_counters": self.daily_counters,
+                "task_counters": self.task_counters
+            }, f, indent=2)
+
+    def _model_cost(self, model: str) -> ModelCost:
+        """
+        Return ModelCost for `model`. If not found, assume zero cost.
+        """
+        return self.pricing.get(model, ModelCost(0.0, 0.0))
+
+    def _check_date_rollover(self):
+        """
+        If UTC date has changed since initialization, reset counters.
+        """
+        today = datetime.datetime.utcnow().strftime("%Y%m%d")
+        if today != self.today:
+            self.today = today
+            self.daily_counters = {}
+            self.task_counters = {}
+            self._persist_daily_counters()
+
+    def record_usage(self, model: str, prompt_tokens: int, completion_tokens: int, task_id: str):
+        """
+        Record a single LLM call’s usage:
+        - Increment input/output tokens
+        - Compute cost = (prompt_tokens/1000)*input_rate + (completion_tokens/1000)*output_rate
+        - Add to both daily and per-task counters
+        """
+        with self.lock:
+            self._check_date_rollover()
+
+            # Get or initialize model entry
+            mc = self._model_cost(model)
+            entry = self.daily_counters.setdefault(model, {
+                "input_tokens": 0.0, "output_tokens": 0.0, "cost": 0.0
+            })
+
+            entry["input_tokens"] += prompt_tokens
+            entry["output_tokens"] += completion_tokens
+
+            # Compute cost
+            cost = (prompt_tokens / 1000.0) * mc.input_per_1k + (completion_tokens / 1000.0) * mc.output_per_1k
+            entry["cost"] += cost
+
+            # Per-task
+            tcost = self.task_counters.get(task_id, 0.0)
+            tcost += cost
+            self.task_counters[task_id] = tcost
+
+            # Persist
+            self._persist_daily_counters()
+
+            return cost
+
+    def get_daily_spent(self) -> float:
+        """
+        Return total cost spent today across all models.
+        """
+        with self.lock:
+            self._check_date_rollover()
+            return sum(entry["cost"] for entry in self.daily_counters.values())
+
+    def get_task_spent(self, task_id: str) -> float:
+        """
+        Return total cost spent on a given task today.
+        """
+        with self.lock:
+            return self.task_counters.get(task_id, 0.0)
+
+    def can_spend(self, model: str, prompt_tokens: int, completion_tokens: int, task_id: str) -> bool:
+        """
+        Return True if adding this call’s cost would keep us under both daily and per-task caps.
+        """
+        with self.lock:
+            self._check_date_rollover()
+            mc = self._model_cost(model)
+            anticipated_cost = (prompt_tokens / 1000.0) * mc.input_per_1k + (completion_tokens / 1000.0) * mc.output_per_1k
+            if self.get_daily_spent() + anticipated_cost > self.settings.daily_cost_cap:
+                return False
+            if self.get_task_spent(task_id) + anticipated_cost > self.settings.per_task_cost_cap:
+                return False
+            return True
+
+    def get_remaining_daily_budget(self) -> float:
+        """
+        Return the dollar amount left in today’s budget.
+        """
+        return max(0.0, self.settings.daily_cost_cap - self.get_daily_spent())
+
+    def get_remaining_task_budget(self, task_id: str) -> float:
+        """
+        Return the dollar amount left for the given task.
+        """
+        return max(0.0, self.settings.per_task_cost_cap - self.get_task_spent(task_id))
+```
+
+> **Highlights**
+>
+> 1. **`CostManager` Constructor**
+>
+>    * Loads `pricing.json` into `self.pricing`.
+>    * Initializes empty counters for today and per‐task, then calls `_load_daily_counters()` to read any existing on‐disk counters (e.g. if the agent restarted midday).
+> 2. **`record_usage(...)`**
+>
+>    * Checks if date rolled over to reset counters if needed.
+>    * Updates `daily_counters[model]` with new input/output token counts.
+>    * Computes `cost = (prompt_tokens/1000)*input_rate + (completion_tokens/1000)*output_rate`.
+>    * Updates per‐task cost in `self.task_counters[task_id]`.
+>    * Persists both maps to `logs/costs_YYYYMMDD.json`.
+> 3. **`can_spend(...)`**
+>
+>    * Returns `False` if adding the anticipated cost would exceed `daily_cost_cap` or `per_task_cost_cap`.
+> 4. **`get_remaining_*` methods** return how much budget is left.
+
+---
+
+## 6 OpenTelemetry Instrumentation
+
+We want to trace:
+
+* **LLM calls** (both chat and embedding calls).
+* **Embedding requests** (to separate embedding vs. text2im).
+* **Task execution** (top‐level span, child spans for planning, retrieval, executor).
+* **Tool calls** (so we can see filesystem, tests, diff writing).
+
+### 6.1 Global Tracer Setup (`agent/monitoring/otel.py`)
+
+Create a new module to initialize OpenTelemetry:
+
+```python
+# coding-agent/agent/monitoring/otel.py
+
+import os
+from opentelemetry import trace, metrics
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter, OTLPSpanExporter
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import (
+    AggregationTemporality,
+    ConsoleMetricExporter,
+    PeriodicExportingMetricReader,
+    OTLPMetricExporter
+)
+from agent.config import get_settings
+
+def configure_opentelemetry():
+    settings = get_settings()
+    service_name = "coding-agent"
+
+    # ----------------------------
+    # Trace Provider
+    # ----------------------------
+    resource = Resource.create({"service.name": service_name})
+    tracer_provider = TracerProvider(resource=resource)
+    trace.set_tracer_provider(tracer_provider)
+
+    # Console exporter (for local debugging)
+    console_exporter = ConsoleSpanExporter()
+    tracer_provider.add_span_processor(BatchSpanProcessor(console_exporter))
+
+    # OTLP exporter if endpoint set
+    if settings.otlp_endpoint:
+        otlp_exporter = OTLPSpanExporter(
+            endpoint=settings.otlp_endpoint,
+            headers=settings.otlp_headers or {}
+        )
+        tracer_provider.add_span_processor(BatchSpanProcessor(otlp_exporter))
+
+    # ----------------------------
+    # Metrics Provider
+    # ----------------------------
+    metric_reader = PeriodicExportingMetricReader(
+        OTLPMetricExporter(endpoint=settings.otlp_endpoint, headers=settings.otlp_headers or {}),
+        export_interval_millis=60000  # export every 60s
+    )
+    meter_provider = MeterProvider(
+        resource=resource,
+        metric_readers=[metric_reader]
+    )
+    metrics.set_meter_provider(meter_provider)
+
+    # Optional: add console exporter for metrics
+    console_metric_exporter = ConsoleMetricExporter(aggregation_temporality=AggregationTemporality.CUMULATIVE)
+    metric_reader_console = PeriodicExportingMetricReader(
+        console_metric_exporter, export_interval_millis=60000
+    )
+    meter_provider._sdk_config.metric_readers.append(metric_reader_console)
+
+    tracer = trace.get_tracer(__name__)
+    tracer.info("OpenTelemetry configured. OTLP endpoint: %s", settings.otlp_endpoint)
+```
+
+> **What This Does**
+>
+> * **TracerProvider** with a resource named `"coding-agent"`.
+> * **SpanProcessors**:
+>
+>   * `ConsoleSpanExporter` logs spans to stdout (useful locally).
+>   * If `settings.otlp_endpoint` is set, an `OTLPSpanExporter` sends spans to that endpoint.
+> * **MeterProvider**:
+>
+>   * A `PeriodicExportingMetricReader` with an `OTLPMetricExporter` sending metrics every 60 seconds.
+>   * Also a `ConsoleMetricExporter` for debugging.
+
+Call `configure_opentelemetry()` at the very start of your entrypoints (right after `configure_logger()` in `cli/main.py`):
+
+```python
+from agent.monitoring.logger import configure_logger
+from agent.monitoring.otel import configure_opentelemetry
+
+configure_logger()
+configure_opentelemetry()
+```
+
+### 6.2 Instrumenting LLM Calls
+
+Wherever we make an OpenAI (or Anthropic) API call, wrap it in a **span** and record token usage and cost.
+
+#### Example: Wrapping ChatCompletion
+
+In `agent/executor.py`, locate the LLM call in `_react_loop`:
+
+```python
+response = openai.ChatCompletion.create(
+    model=self.settings.model_router_default,
+    messages=prompt_payload["messages"],
+    temperature=0.2,
+    max_tokens=1000
+)
+```
+
+Wrap this in an OpenTelemetry span:
+
+```python
+from opentelemetry import trace
+from agent.monitoring.costs import CostManager
+from agent.monitoring.metrics import llm_calls_total, tokens_input_total, tokens_output_total, cost_total_per_model
+
+# Assume CostManager is instantiated at Executor.init
+self.cost_manager = CostManager()
+
+# In _react_loop:
+tracer = trace.get_tracer(__name__)
+with tracer.start_as_current_span("llm_chat_completion", attributes={"model": self.settings.model_router_default}):
+    # Before calling, check budget
+    # We need to estimate prompt_tokens (we can token-count via some tokenizer, or wait for response. For simplicity, wait for usage)
+    response = openai.ChatCompletion.create(
+        model=self.settings.model_router_default,
+        messages=prompt_payload["messages"],
+        temperature=0.2,
+        max_tokens=1000
+    )
+    # Extract usage
+    usage = response["usage"]
+    prompt_tokens = usage.get("prompt_tokens", 0)
+    completion_tokens = usage.get("completion_tokens", 0)
+
+    # Record tokens to metrics
+    tokens_input_total.labels(model=self.settings.model_router_default).inc(prompt_tokens)
+    tokens_output_total.labels(model=self.settings.model_router_default).inc(completion_tokens)
+    llm_calls_total.labels(model=self.settings.model_router_default).inc()
+
+    # Record cost
+    cost = self.cost_manager.record_usage(
+        model=self.settings.model_router_default,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        task_id=task.id
+    )
+    cost_total_per_model.labels(model=self.settings.model_router_default).inc(cost)
+
+    # If cost exceeds caps now, handle according to kill switch
+    if not self.cost_manager.can_spend(
+        model=self.settings.model_router_default,
+        prompt_tokens=0,
+        completion_tokens=0,
+        task_id=task.id
+    ):
+        # Budget is breached. Depending on settings.cost_exceeded_behavior:
+        if self.settings.cost_exceeded_behavior == "disable":
+            raise RuntimeError("Daily or per-task cost cap reached; aborting further LLM calls.")
+        else:
+            # Fallback: switch to cheaper model for subsequent calls
+            self.settings.model_router_default = self.settings.fallback_model
+            logger.warning("Switching to fallback model %s due to budget constraints", self.settings.fallback_model)
+```
+
+> **Explanation**
+>
+> * We start a span named `"llm_chat_completion"` with attribute `model=...`.
+> * After the call, we extract `prompt_tokens` and `completion_tokens` from `response["usage"]`.
+> * We increment Prometheus counters (to define next).
+> * We call `CostManager.record_usage(...)` which computes the cost and persists it.
+> * We then check `can_spend(...)` again with `0` tokens (to see if we hit the cap). If we did, we enforce kill switch or fallback.
+
+#### Prometheus Metrics Definitions (Extend `agent/monitoring/metrics.py`)
+
+Add at the top:
+
+```python
+from prometheus_client import Counter, Gauge, Histogram
+
+# Existing metrics …
+
+# New token & cost metrics:
+tokens_input_total = Counter(
+    "tokens_input_total", "Total input tokens consumed", ["model"]
+)
+tokens_output_total = Counter(
+    "tokens_output_total", "Total output tokens consumed", ["model"]
+)
+cost_total_per_model = Counter(
+    "cost_total_per_model_usd", "Total USD cost incurred per model", ["model"]
+)
+daily_cost_remaining = Gauge(
+    "daily_cost_remaining_usd", "Remaining USD budget for today"
+)
+task_cost_total = Gauge(
+    "task_cost_total_usd", "Total USD spent on a given task", ["task_id"]
+)
+```
+
+Whenever we call `self.cost_manager.record_usage`, we also set:
+
+```python
+daily_cost_remaining.set(self.cost_manager.get_remaining_daily_budget())
+task_cost_total.labels(task_id=task.id).set(self.cost_manager.get_task_spent(task.id))
+```
+
+This keeps Prometheus informed of budgets.
+
+---
+
+## 7 Kill Switch Implementation
+
+We must integrate a check **before** issuing any LLM call to see if the anticipated usage (even if unknown beforehand, use a worst‐case estimate) would exceed. Practically, since we cannot know `completion_tokens` ahead of time, we:
+
+1. **Before the call**:
+
+   * Compute an upper‐bound of `completion_tokens` (e.g., `max_tokens` passed to the call).
+   * Estimate `prompt_tokens` by counting tokens in `messages` (use a simple tokenizer or approximate as `len(text) / 4`).
+   * Call `can_spend(model, est_prompt_tokens, est_completion_tokens, task_id)`.
+   * If `False`, trigger kill switch: either switch to fallback model or raise error.
+
+2. **After the call**:
+
+   * Reconcile actual usage from `response["usage"]`. If more expensive than anticipated and exceeded, enforce kill switch (either mid‐session or on subsequent calls).
+
+### 7.1 Estimating `prompt_tokens`
+
+A robust approach is to use tiktoken or a similar tokenizer. For now, we can approximate:
+
+```python
+def estimate_tokens(text: str) -> int:
+    # Very rough: assume 4 characters ≈ 1 token
+    return max(1, len(text) // 4)
+```
+
+In `_react_loop`, before calling LLM:
+
+```python
+# Build the entire prompt as a single string (concatenate all "messages")
+prompt_str = "".join([m["content"] for m in prompt_payload["messages"]])
+est_prompt_tokens = estimate_tokens(prompt_str)
+est_completion_tokens = self.settings.max_tokens or 1000  # default
+
+if not self.cost_manager.can_spend(
+    model=self.settings.model_router_default,
+    prompt_tokens=est_prompt_tokens,
+    completion_tokens=est_completion_tokens,
+    task_id=task.id
+):
+    # Kill switch
+    if self.settings.cost_exceeded_behavior == "disable":
+        raise RuntimeError("Cannot call LLM: would exceed cost cap.")
+    else:
+        self.settings.model_router_default = self.settings.fallback_model
+        logger.warning("Budget low: falling back to %s", self.settings.fallback_model)
+```
+
+After the call, use actual token counts to correct any discrepancies.
+
+---
+
+## 8 Embedding Calls Instrumentation
+
+Embedding calls also consume tokens and cost (from `code_embedding_model` or `skill_embedding_model`). Wrap similar around `embed_texts`:
+
+```python
+from opentelemetry import trace
+from agent.monitoring.costs import CostManager
+from agent.monitoring.metrics import embed_requests_total, tokens_input_total, cost_total_per_model
+
+# Assume self.cost_manager exists in classes that embed texts
+
+def embed_texts(texts: List[str]) -> List[List[float]]:
+    settings = get_settings()
+    model = settings.code_embedding_model
+    tracer = trace.get_tracer(__name__)
+
+    embeddings = []
+    with tracer.start_as_current_span("embedding_request", attributes={"model": model}):
+        # Estimate prompt_tokens as sum of tokens for each text
+        est_prompt_tokens = sum(estimate_tokens(t) for t in texts)
+        est_completion_tokens = 0  # embeddings typically only count prompt
+
+        # Kill switch check
+        # Use a fake task_id "__embedding__" or pass in real if part of a task
+        if not cost_manager.can_spend(model, est_prompt_tokens, est_completion_tokens, task_id="__embed__"):
+            if settings.cost_exceeded_behavior == "disable":
+                raise RuntimeError("Embedding cost cap reached. Cannot proceed.")
+            else:
+                model = settings.fallback_model
+
+        # Perform actual embedding (calls our wrapped OpenAI)
+        real_embeddings = _actual_embed_texts(texts)  # calls OpenAI API
+
+        # Extract actual token usage from response
+        # OpenAI returns usage for embeddings? If not, estimate as input = sum tokens
+        actual_input_tokens = sum(estimate_tokens(t) for t in texts)
+        actual_output_tokens = 0
+
+        embed_requests_total.labels(model=model).inc(1)
+        tokens_input_total.labels(model=model).inc(actual_input_tokens)
+
+        cost = cost_manager.record_usage(
+            model=model,
+            prompt_tokens=actual_input_tokens,
+            completion_tokens=actual_output_tokens,
+            task_id="__embed__"
+        )
+        cost_total_per_model.labels(model=model).inc(cost)
+        embeddings = real_embeddings
+
+    return embeddings
+```
+
+> **Notes**
+>
+> * Embedding endpoints typically bill only on input tokens, not output.
+> * We track a synthetic `task_id="__embed__"` so we can see embedding costs separately.
+> * We wrap the call in an OTLP span `"embedding_request"`.
+> * We run the kill switch before calling.
+
+---
+
+## 9 Extending Metrics for Cost & Token Usage
+
+In `agent/monitoring/metrics.py`, ensure the new metrics exist:
+
+```python
+from prometheus_client import Counter, Gauge
+
+# … existing metrics …
+
+tokens_input_total = Counter(
+    "tokens_input_total", "Total input tokens consumed", ["model"]
+)
+tokens_output_total = Counter(
+    "tokens_output_total", "Total output tokens consumed", ["model"]
+)
+cost_total_per_model = Counter(
+    "cost_total_per_model_usd", "Total USD cost incurred per model", ["model"]
+)
+daily_cost_remaining = Gauge(
+    "daily_cost_remaining_usd", "Remaining USD budget for today"
+)
+task_cost_total = Gauge(
+    "task_cost_total_usd", "Total USD spent on a given task", ["task_id"]
+)
+```
+
+* Increment these in `CostManager.record_usage` and after each LLM/embedding call.
+* In the same module (or elsewhere), set `daily_cost_remaining` and `task_cost_total` after each call:
+
+```python
+from agent.monitoring.metrics import daily_cost_remaining, task_cost_total
+
+# After recording usage for LLM:
+daily_cost_remaining.set(self.cost_manager.get_remaining_daily_budget())
+task_cost_total.labels(task_id=task.id).set(self.cost_manager.get_task_spent(task.id))
+```
+
+---
+
+## 10 CLI Command: View Current Cost Usage (`cli/commands/pricing.py`)
+
+Provide a CLI command to query current spending:
+
+```python
+# coding-agent/cli/commands/pricing.py
+
+import typer
+from tabulate import tabulate
+from agent.monitoring.costs import CostManager
+
+app = typer.Typer(help="Query current token and cost usage")
+
+@app.command("status")
+def cost_status():
+    """
+    Show current daily and per‐task spending.
+    """
+    cm = CostManager()
+    daily_spent = cm.get_daily_spent()
+    remaining = cm.get_remaining_daily_budget()
+
+    table = [
+        ["Daily Spent (USD)", f"${daily_spent:.4f}"],
+        ["Daily Remaining (USD)", f"${remaining:.4f}"]
+    ]
+    # Per‐model breakdown
+    model_rows = []
+    for model, data in cm.daily_counters.items():
+        model_rows.append([
+            model,
+            data["input_tokens"],
+            data["output_tokens"],
+            f"${data['cost']:.4f}"
+        ])
+
+    print("=== Overall Budget ===")
+    print(tabulate(table, headers=["Metric", "Value"], tablefmt="github"))
+    print("\n=== By Model ===")
+    print(tabulate(model_rows, headers=["Model", "Input Tokens", "Output Tokens", "Cost (USD)"], tablefmt="github"))
+
+    # Per‐Task breakdown
+    task_rows = []
+    for task_id, cost in cm.task_counters.items():
+        task_rows.append([task_id, f"${cost:.4f}"])
+    if task_rows:
+        print("\n=== By Task ===")
+        print(tabulate(task_rows, headers=["Task ID", "Cost (USD)"], tablefmt="github"))
+    else:
+        print("\nNo tasks recorded yet.")
+```
+
+Usage:
+
+```bash
+agent pricing status
+```
+
+This prints a GitHub‐styled table of spending.
+
+---
+
+## 11 Tests for Cost Control & Telemetry (`tests/test_monitoring.py` Updates)
+
+Extend `tests/test_monitoring.py` with new tests:
+
+```python
+# coding-agent/tests/test_monitoring.py
+
+import os
+import json
+import tempfile
+import time
+import pytest
+from pathlib import Path
+from agent.monitoring.costs import CostManager, ModelCost
+
+# --------------------------------------------------------------------------------
+# 1. Test CostManager.record_usage and budget checks
+# --------------------------------------------------------------------------------
+
+def test_cost_manager_basic(tmp_path, monkeypatch):
+    # Monkeypatch AGENT_HOME and create pricing.json
+    monkeypatch.setenv("AGENT_HOME", str(tmp_path))
+    pricing = {
+        "test-model": {"input_per_1k": 1.0, "output_per_1k": 2.0}  # $1 per 1k in, $2 per 1k out
+    }
+    (tmp_path / "pricing.json").write_text(json.dumps(pricing))
+
+    cm = CostManager()
+    # Record usage: 500 input tokens, 250 output tokens
+    cost = cm.record_usage("test-model", prompt_tokens=500, completion_tokens=250, task_id="T-1")
+    # Cost = (500/1000)*1.0 + (250/1000)*2.0 = 0.5 + 0.5 = $1.0
+    assert abs(cost - 1.0) < 1e-6
+    assert abs(cm.get_daily_spent() - 1.0) < 1e-6
+    assert abs(cm.get_task_spent("T-1") - 1.0) < 1e-6
+
+    # Test can_spend: daily cap default is $20, per-task cap $0.5
+    # This call should exceed per-task cap
+    can = cm.can_spend("test-model", prompt_tokens=100, completion_tokens=0, task_id="T-1")
+    assert can is False
+
+    # But a new task can spend up to $0.5
+    can2 = cm.can_spend("test-model", prompt_tokens=400, completion_tokens=0, task_id="T-2")
+    # Cost = (400/1000)*1.0 = 0.4 which is < 0.5 → allowed
+    assert can2 is True
+
+# --------------------------------------------------------------------------------
+# 2. Test date rollover resets counters
+# --------------------------------------------------------------------------------
+
+def test_cost_manager_rollover(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_HOME", str(tmp_path))
+    pricing = {"model-A": {"input_per_1k": 1.0, "output_per_1k": 1.0}}
+    (tmp_path / "pricing.json").write_text(json.dumps(pricing))
+
+    cm = CostManager()
+    cm.record_usage("model-A", prompt_tokens=1000, completion_tokens=0, task_id="T-1")  # $1
+    assert abs(cm.get_daily_spent() - 1.0) < 1e-6
+
+    # Simulate date change: manipulate internal date and run _check_date_rollover
+    cm.today = "19990101"  # force mismatch
+    cm._check_date_rollover()
+    # Counters should be reset
+    assert cm.get_daily_spent() == 0.0
+    assert cm.get_task_spent("T-1") == 0.0
+
+# --------------------------------------------------------------------------------
+# 3. Test pricing file missing model defaults to zero cost
+# --------------------------------------------------------------------------------
+
+def test_unknown_model_defaults_zero(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_HOME", str(tmp_path))
+    pricing = {"other-model": {"input_per_1k": 1.0, "output_per_1k": 1.0}}
+    (tmp_path / "pricing.json").write_text(json.dumps(pricing))
+
+    cm = CostManager()
+    # Record usage for unknown model "foo-model"
+    cost = cm.record_usage("foo-model", prompt_tokens=1000, completion_tokens=1000, task_id="T-1")
+    # Since foo-model not in pricing, cost rate = 0 → cost = 0
+    assert cost == 0.0
+    assert cm.get_daily_spent() == 0.0
+
+# --------------------------------------------------------------------------------
+# 4. Test metrics export integration (basic)
+# --------------------------------------------------------------------------------
+
+from agent.monitoring.metrics import tokens_input_total, tokens_output_total, cost_total_per_model
+
+def test_metrics_increment(monkeypatch):
+    # Create some increments
+    tokens_input_total.labels(model="m1").inc(10)
+    tokens_output_total.labels(model="m1").inc(5)
+    cost_total_per_model.labels(model="m1").inc(0.1234)
+
+    # Since Prometheus client stores them in memory, ensure no exceptions exporting
+    from agent.monitoring.metrics import generate_latest, CONTENT_TYPE_LATEST
+    data = generate_latest()
+    assert b"tokens_input_total" in data
+    assert b"tokens_output_total" in data
+    assert b"cost_total_per_model_usd" in data
+    assert b"m1" in data
+```
+
+> **Explanation**
+>
+> 1. **`test_cost_manager_basic`**:
+>
+>    * Uses a custom pricing file where `"test-model"` costs \$1/1k input, \$2/1k output.
+>    * Calling `record_usage(500, 250)` → cost \$1.
+>    * Ensures `get_daily_spent()` and `get_task_spent()` reflect \$1.
+>    * Verifies `can_spend()` returns `False` if further cost would exceed per-task cap \$0.50, and `True` for a new task staying under cap.
+> 2. **`test_cost_manager_rollover`**:
+>
+>    * Records usage, then forcibly back‐dates `cm.today`.
+>    * Calls `_check_date_rollover()` → counters reset to zero.
+> 3. **`test_unknown_model_defaults_zero`**:
+>
+>    * Pricing file does not list `"foo-model"`.
+>    * Recording usage under `"foo-model"` yields cost \$0, not an error.
+> 4. **`test_metrics_increment`**:
+>
+>    * Increments the new Prometheus metrics.
+>    * Calls `generate_latest()` to ensure the metrics appear in the output.
+
+Ensure all tests pass:
+
+```bash
+poetry run pytest --maxfail=1 --disable-warnings -q
+```
+
+---
+
+## 12 Developer Walkthrough for Phase X
+
+1. **Install Dependencies**
+
+   ```bash
+   poetry install
+   poetry shell
+   ```
+
+2. **Set Environment & Configuration**
+
+   * Copy `.env.example` → `.env`.
+   * Fill in:
+
+     ```
+     OPENAI_API_KEY=sk-...
+     AGENT_HOME=/path/to/coding-agent
+     daily_cost_cap=20.0
+     per_task_cost_cap=0.5
+     cost_exceeded_behavior=disable
+     fallback_model=gpt-4o-nano
+     otlp_endpoint=http://localhost:4317   # if you run a local OTLP collector
+     otlp_headers={}
+     ```
+   * Ensure `pricing.json` exists with correct rates.
+
+3. **Initialize Logging & Telemetry**
+
+   ```bash
+   python - <<'EOF'
+   ```
+
+from agent.monitoring.logger import configure\_logger
+from agent.monitoring.otel import configure\_opentelemetry
+configure\_logger()
+configure\_opentelemetry()
+print("Logging and telemetry initialized.")
+EOF
+
+````
+
+4. **Run a Task & Observe Cost Logging**  
+```bash
+agent run --task T-1 --verbose
+````
+
+* You should see detailed log lines indicating token counts and cost:
+
+  ```
+  2025-06-15 12:00:00.123 | INFO    | ... executor.py:XXX – Using model gpt-4o-full
+  2025-06-15 12:00:05.456 | INFO    | ... costs.py:XXX – Recorded usage for model gpt-4o-full: prompt_tokens=200, completion_tokens=150, cost=$0.021
+  2025-06-15 12:00:05.457 | INFO    | ... executor.py:YYY – Remaining daily budget: $19.979
+  ```
+* If the per-task cap (\$0.50) is exceeded mid-task, you’ll see:
+
+  ```
+  2025-06-15 12:05:10.789 | ERROR   | ... executor.py:ZZZ – Cannot call LLM: would exceed per-task cost cap.
+  ```
+
+  and the task ends with `status: cost_exceeded`.
+
+5. **Check Prometheus Metrics**
+
+   ```bash
+   curl http://localhost:8000/metrics | grep tokens_input_total
+   ```
+
+   * You’ll see lines like:
+
+     ```
+     tokens_input_total{model="gpt-4o-full"} 350.0
+     tokens_output_total{model="gpt-4o-full"} 250.0
+     cost_total_per_model_usd{model="gpt-4o-full"} 0.035
+     daily_cost_remaining_usd 19.965   # for example
+     task_cost_total_usd{task_id="T-1"} 0.035
+     ```
+
+6. **Simulate Budget Exceeded**
+
+   * Temporarily lower `per_task_cost_cap` to a tiny amount (e.g. `0.001`) in `.agent.yml` and rerun the same task.
+   * The agent should immediately refuse the LLM call with a clear error log:
+
+     ```
+     ERROR – per-task cost cap reached; aborting.
+     ```
+   * Run `agent pricing status` to see that the task cost is recorded as an attempted \$0.00 (because no call was made) and daily spent remains \$0.00.
+
+7. **Generate Traces (Optional)**
+   If you have a local OTLP collector (e.g., `otelcol`), set `otlp_endpoint` accordingly. Run:
+
+   ```bash
+   otelcol --config otel-config.yaml
+   ```
+
+   Then run a task.
+   In your tracing UI (e.g., Jaeger), you’ll see spans named `llm_chat_completion`, `embedding_request`, etc., with attributes:
+
+   * `model="gpt-4o-full"`
+   * `prompt_tokens=200`, `completion_tokens=150`, `cost=0.021`
+   * Timestamps and parent spans `execute_task` or similar.
+
+8. **View Current Cost Status**
+
+   ```bash
+   agent pricing status
+   ```
+
+   You should see a table, for example:
+
+   ```
+   === Overall Budget ===
+   | Metric                 | Value   |
+   |------------------------|---------|
+   | Daily Spent (USD)      | $0.0350 |
+   | Daily Remaining (USD)  | $19.965 |
+
+   === By Model ===
+   | Model         | Input Tokens | Output Tokens | Cost (USD) |
+   |---------------|--------------|---------------|------------|
+   | gpt-4o-full   | 350          | 250           | $0.035     |
+
+   === By Task ===
+   | Task ID | Cost (USD) |
+   |---------|------------|
+   | T-1     | $0.035     |
+   ```
+
+9. **Run CI & Health Checks**
+
+   ```bash
+   poetry run pytest --maxfail=1 --disable-warnings -q
+   ./healthcheck.sh
+   ```
+
+   Ensure health checks pass. If you deliberately break `pricing.json`, healthcheck should fail and alert via Slack/email as configured.
+
+---
+
+## 13 Phase X Exit Criteria
+
+Ensure **all** of the following before moving on:
+
+1. **Configuration & Pricing**
+
+   * `pricing.json` exists with correct rates for each model you intend to use.
+   * `.agent.yml` or `.env` defines `daily_cost_cap`, `per_task_cost_cap`, `cost_exceeded_behavior`, `fallback_model`, `otlp_endpoint` (optional).
+
+2. **CostManager Functionality**
+
+   * `agent/monitoring/costs.py` implements:
+
+     * Loading/storing of daily and per-task counters in `logs/costs_YYYYMMDD.json`.
+     * Correct cost computation per model.
+     * `can_spend(...)` refuses if budget would be exceeded.
+   * Tests (`tests/test_monitoring.py`) for `CostManager` pass.
+
+3. **LLM & Embedding Instrumentation**
+
+   * All calls to `openai.ChatCompletion.create()` and `openai.Embedding.create()` (or `Anthropic` calls) are wrapped in OTLP spans.
+   * Prometheus counters `tokens_input_total`, `tokens_output_total`, `cost_total_per_model_usd` are incremented correctly.
+   * Gauges `daily_cost_remaining_usd` and `task_cost_total_usd{task_id}` are set after each call.
+   * Tests confirm metric names appear in `generate_latest()` output.
+
+4. **Kill Switch Logic**
+
+   * Before each LLM or embedding call, `can_spend(...)` is evaluated.
+   * On budget exceed:
+
+     * If `cost_exceeded_behavior="disable"`, raise a clear `RuntimeError` and mark the task status as `"cost_exceeded"`.
+     * If `="fallback"`, switch to `fallback_model` for subsequent calls, logging a warning.
+
+5. **OpenTelemetry Setup**
+
+   * `agent/monitoring/otel.py` configures tracing with `ConsoleSpanExporter` and optionally `OTLPSpanExporter`.
+   * `configure_opentelemetry()` is called at startup of CLI.
+   * Spans show up in stdout and OTLP endpoint if configured.
+
+6. **Prometheus Metrics Export**
+
+   * `/metrics` endpoint (via Uvicorn) now contains the new token and cost metrics alongside existing ones.
+   * Metrics server runs without errors (tested manually via `curl`).
+
+7. **CLI Pricing Command**
+
+   * `cli/commands/pricing.py` allows `agent pricing status` to print current spending tables.
+   * If no usage yet, it prints zeros or “No tasks recorded yet.”
+
+8. **Logging Enhancements**
+
+   * Log lines include token and cost information for each API call.
+   * Budget warnings/errors are logged at WARN or ERROR level, respectively.
+   * `logs/agent.log` rotates and retains per settings in **Phase IX**.
+
+9. **Health Checks**
+
+   * `healthcheck.sh` now also verifies that `pricing.json` exists and is parseable.
+   * If pricing file is missing or malformed, healthcheck fails.
+
+10. **Tests Passing**
+
+    ```bash
+    poetry run pytest --maxfail=1 --disable-warnings -q
+    ```
+
+    All tests from `tests/` (including new cost and telemetry tests) pass.
+
+11. **Manual Verification**
+
+    * Run a multi‐task sequence that deliberately exceeds per‐task or daily budgets; confirm that the agent halts or falls back appropriately.
+    * Confirm metrics reflect token and cost counts.
+    * Confirm OTLP spans appear if an OTLP collector is running.
+
+Once these are satisfied, Phase X is complete. Your agent now has full **Telemetry & Cost Control**: every token is accounted for, every dollar tracked, budgets enforced, and all interactions traced and exported.

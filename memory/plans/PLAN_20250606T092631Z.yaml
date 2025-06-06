@@ -1,0 +1,20 @@
+---
+tasks:
+- id: T-2
+  description: Create hello world script
+  accept_tests:
+  - python hello.py | grep 'Hello, world!'
+  budget:
+    tokens: 1000
+    dollars: 0.02
+  owner: agent
+  status: pending
+- id: T-3
+  description: Test the script
+  accept_tests:
+  - pytest -v test_hello.py
+  budget:
+    tokens: 1000
+    dollars: 0.03
+  owner: agent
+  status: pending
